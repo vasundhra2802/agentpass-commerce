@@ -1,12 +1,21 @@
-import {useState} from "react";
+import { useState,useEffect } from "react";
 function App() {
   const [productName, setProductName] = useState("");
+  const [products, setProducts] = useState([]);
   const [category, setCategory] = useState("");
   const [price, setPrice] = useState(0);
   const [colour, setColour] = useState("");
   const [size, setSize] = useState("");
   const [stock, setStock] = useState(0);
   const [message, setMessage] = useState("");
+  useEffect(() => {
+  fetch("http://127.0.0.1:8000/products")
+    .then((response) => response.json())
+    .then((data) => {
+      setProducts(data);
+    });
+}, []);
+
 
   const handleSubmit = (e) => {
     e.preventDefault();
@@ -30,6 +39,15 @@ function App() {
   .then((data) => {
     console.log(data);
     setMessage(data.message);
+    setProducts((prevProducts) => [...prevProducts, data.product
+
+    ]);
+    setProductName("");
+    setCategory("");
+    setPrice("");
+    setColour("");
+    setSize("");
+    setStock("");
   });
   };
 
@@ -103,6 +121,18 @@ function App() {
         <p>{message}</p>
         
       </form>
+      <h2>Saved Products</h2>
+
+      {products.map((product) => (
+        <div key={product.id}>
+          <h3>{product.productName}</h3>
+          <p>Category: {product.category}</p>
+          <p>Price: ₹{product.price}</p>
+          <p>Colour: {product.colour}</p>
+          <p>Size: {product.size}</p>
+          <p>Stock: {product.stock}</p>
+        </div>
+      ))}
     </div>
   );
 }
