@@ -19,3 +19,8 @@ Removed the semicolon and chained .then() directly to fetch.
 
 What I learned:
 JavaScript promise methods such as .then() must be chained to the promise returned by fetch().
+
+
+Problem: Backend failed to start due to incorrect SessionLocal import.
+Cause: Typo in variable name.
+Fix: Changed SessionalLocal to SessionLocal.
