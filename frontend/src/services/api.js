@@ -1,0 +1,251 @@
+const API_BASE_URL = "http://127.0.0.1:8000";
+
+export async function getProducts() {
+  const response = await fetch(`${API_BASE_URL}/products`);
+
+  if (!response.ok) {
+    throw new Error("Could not load products");
+  }
+
+  return response.json();
+}
+
+export async function createProduct(product) {
+  const response = await fetch(`${API_BASE_URL}/products`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(product),
+  });
+
+  const data = await response.json();
+
+  if (!response.ok) {
+    throw new Error(data.detail || "Could not save product");
+  }
+
+  return data;
+}
+
+export async function getRecommendations(query) {
+  const response = await fetch(`${API_BASE_URL}/recommend`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ query }),
+  });
+
+  const data = await response.json();
+
+  if (!response.ok) {
+    throw new Error(
+      data.detail || "Could not get recommendations"
+    );
+  }
+
+  return data;
+}
+export async function deleteProduct(productId) {
+  const response = await fetch(
+    `${API_BASE_URL}/products/${productId}`,
+    {
+      method: "DELETE",
+    }
+  );
+
+  const data = await response.json();
+
+  if (!response.ok) {
+    throw new Error(
+      data.detail || "Could not delete product"
+    );
+  }
+
+  return data;
+}
+export async function updateProduct(productId, product) {
+  const response = await fetch(
+    `${API_BASE_URL}/products/${productId}`,
+    {
+      method: "PUT",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(product),
+    }
+  );
+
+  const data = await response.json();
+
+  if (!response.ok) {
+    throw new Error(
+      data.detail || "Could not update product"
+    );
+  }
+
+  return data;
+}
+export async function checkPolicy(items, maxBudget) {
+  const response = await fetch(
+    `${API_BASE_URL}/policy/check`,
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        items: items.map((item) => ({
+          product_id: item.id,
+          quantity: item.quantity,
+        })),
+        max_budget: maxBudget,
+      }),
+    }
+  );
+
+  const data = await response.json();
+
+  if (!response.ok) {
+    throw new Error(
+      data.detail || "Policy check failed"
+    );
+  }
+
+  return data;
+}
+export async function approvePurchase(
+  items,
+  maxBudget
+) {
+  const response = await fetch(
+    `${API_BASE_URL}/payment/approve`,
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        items: items.map((item) => ({
+          product_id: item.id,
+          quantity: item.quantity,
+        })),
+        max_budget: maxBudget,
+      }),
+    }
+  );
+
+  const data = await response.json();
+
+  if (!response.ok) {
+    throw new Error(
+      data.detail || "Purchase approval failed"
+    );
+  }
+
+  return data;
+}
+
+
+export async function createPaymentOrder(
+  approvalId
+) {
+  const response = await fetch(
+    `${API_BASE_URL}/payment/create-order`,
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        approval_id: approvalId,
+      }),
+    }
+  );
+
+  const data = await response.json();
+
+  if (!response.ok) {
+    throw new Error(
+      data.detail ||
+        "Could not create Razorpay Test order"
+    );
+  }
+
+  return data;
+}
+
+
+export async function verifyPayment(
+  paymentData
+) {
+  const response = await fetch(
+    `${API_BASE_URL}/payment/verify`,
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(paymentData),
+    }
+  );
+
+  const data = await response.json();
+
+  if (!response.ok) {
+    throw new Error(
+      data.detail ||
+        "Payment verification failed"
+    );
+  }
+
+  return data;
+}
+export async function getPaymentTransactions() {
+  const response = await fetch(
+    "http://127.0.0.1:8000/payment-transactions"
+  );
+
+  if (!response.ok) {
+    throw new Error(
+      "Failed to load payment transactions"
+    );
+  }
+
+  return await response.json();
+}
+export async function getAuditLogs() {
+  const response = await fetch(
+    "http://127.0.0.1:8000/audit-logs"
+  );
+
+  if (!response.ok) {
+    throw new Error("Failed to load audit logs");
+  }
+
+  return await response.json();
+}
+export async function getGrowthSuggestions(items, maxBudget) {
+  const response = await fetch(
+    "http://127.0.0.1:8000/growth/suggestions",
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        items,
+        max_budget: maxBudget,
+      }),
+    }
+  );
+
+  if (!response.ok) {
+    throw new Error(
+      "Failed to load growth suggestions"
+    );
+  }
+
+  return await response.json();
+}
