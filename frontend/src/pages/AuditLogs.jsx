@@ -1,5 +1,28 @@
 import { useEffect, useState } from "react";
 import { getAuditLogs } from "../services/api";
+const formatUtcToIst = (value) => {
+  if (!value) return "—";
+
+  const utcValue =
+    value.endsWith("Z") ||
+    value.includes("+")
+      ? value
+      : `${value}Z`;
+
+  return new Date(utcValue).toLocaleString(
+    "en-IN",
+    {
+      timeZone: "Asia/Kolkata",
+      day: "2-digit",
+      month: "2-digit",
+      year: "numeric",
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+      hour12: false,
+    }
+  );
+};
 
 export default function AuditLogs() {
   const [logs, setLogs] = useState([]);
@@ -115,11 +138,7 @@ export default function AuditLogs() {
                   </td>
 
                   <td className="px-5 py-4 text-sm">
-                    {log.created_at
-                      ? new Date(
-                          log.created_at
-                        ).toLocaleString()
-                      : "—"}
+                    {formatUtcToIst(log.created_at)}
                   </td>
                 </tr>
               ))}

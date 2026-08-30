@@ -109,6 +109,127 @@ class AuditLog(Base):
         nullable=False,
         server_default=func.now()
     )
+
+class PurchaseApproval(Base):
+    __tablename__ = "purchase_approvals"
+
+    id = Column(
+        Integer,
+        primary_key=True,
+        index=True
+    )
+
+    approval_id = Column(
+        String,
+        unique=True,
+        nullable=False,
+        index=True
+    )
+
+    items = Column(
+        JSON,
+        nullable=False
+    )
+
+    amount_rupees = Column(
+        Float,
+        nullable=False
+    )
+
+    max_budget = Column(
+        Float,
+        nullable=True
+    )
+
+    used = Column(
+        Boolean,
+        nullable=False,
+        default=False
+    )
+
+    created_at = Column(
+        DateTime,
+        nullable=False
+    )
+
+    expires_at = Column(
+        DateTime,
+        nullable=False,
+        index=True
+    )
+
+
+class PaymentSession(Base):
+    __tablename__ = "payment_sessions"
+
+    id = Column(
+        Integer,
+        primary_key=True,
+        index=True
+    )
+
+    payment_session_id = Column(
+        String,
+        unique=True,
+        nullable=False,
+        index=True
+    )
+
+    approval_id = Column(
+        String,
+        nullable=False,
+        index=True
+    )
+
+    razorpay_order_id = Column(
+        String,
+        unique=True,
+        nullable=False,
+        index=True
+    )
+
+    razorpay_payment_id = Column(
+        String,
+        unique=True,
+        nullable=True,
+        index=True
+    )
+
+    amount_paise = Column(
+        Integer,
+        nullable=False
+    )
+
+    currency = Column(
+        String,
+        nullable=False,
+        default="INR"
+    )
+
+    receipt = Column(
+        String,
+        nullable=True
+    )
+
+    status = Column(
+        String,
+        nullable=False,
+        default="CREATED",
+        index=True
+    )
+
+    created_at = Column(
+        DateTime,
+        nullable=False,
+        server_default=func.now()
+    )
+
+    updated_at = Column(
+        DateTime,
+        nullable=False,
+        server_default=func.now(),
+        onupdate=func.now()
+    )
 class PaymentTransaction(Base):
     __tablename__ = "payment_transactions"
 

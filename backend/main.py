@@ -5,6 +5,7 @@ from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
 import re
 import models
+from datetime import datetime, timedelta, timezone
 import os
 import time
 import hmac
@@ -94,9 +95,6 @@ class PaymentVerifyRequest(BaseModel):
     razorpay_signature: str
 
 app = FastAPI()
-payment_approvals = {}
-payment_sessions = {}
-verified_payment_ids = set()
 app.add_middleware(
     CORSMiddleware,
     allow_origin_regex=r"^http://(localhost|127\.0\.0\.1):\d+$",
@@ -565,12 +563,14 @@ def approve_payment(request: PaymentApprovalRequest):
         # -----------------------------
 
         if not request.items:
-
             create_audit_log(
                 event_type="APPROVAL_BLOCKED",
                 status="BLOCKED",
                 reference_id=approval_attempt_id,
-                message="Purchase approval blocked because the cart was empty.",
+                message=(
+                    "Purchase approval blocked "
+                    "because the cart was empty."
+                ),
                 details={
                     "reason": "EMPTY_CART",
                     "max_budget": request.max_budget,
@@ -593,18 +593,21 @@ def approve_payment(request: PaymentApprovalRequest):
             product = (
                 db.query(models.Product)
                 .filter(
-                    models.Product.id == item.product_id
+                    models.Product.id
+                    == item.product_id
                 )
                 .first()
             )
 
             if not product:
-
                 create_audit_log(
                     event_type="APPROVAL_BLOCKED",
                     status="BLOCKED",
                     reference_id=approval_attempt_id,
-                    message="Purchase approval blocked because a product was not found.",
+                    message=(
+                        "Purchase approval blocked "
+                        "because a product was not found."
+                    ),
                     details={
                         "reason": "PRODUCT_NOT_FOUND",
                         "product_id": item.product_id,
@@ -617,12 +620,14 @@ def approve_payment(request: PaymentApprovalRequest):
                 )
 
             if item.quantity <= 0:
-
                 create_audit_log(
                     event_type="APPROVAL_BLOCKED",
                     status="BLOCKED",
                     reference_id=approval_attempt_id,
-                    message="Purchase approval blocked because quantity was invalid.",
+                    message=(
+                        "Purchase approval blocked "
+                        "because quantity was invalid."
+                    ),
                     details={
                         "reason": "INVALID_QUANTITY",
                         "product_id": product.id,
@@ -636,23 +641,30 @@ def approve_payment(request: PaymentApprovalRequest):
                 )
 
             if item.quantity > product.stock:
-
                 create_audit_log(
                     event_type="APPROVAL_BLOCKED",
                     status="BLOCKED",
                     reference_id=approval_attempt_id,
-                    message="Purchase approval blocked because stock was insufficient.",
+                    message=(
+                        "Purchase approval blocked "
+                        "because stock was insufficient."
+                    ),
                     details={
                         "reason": "INSUFFICIENT_STOCK",
                         "product_id": product.id,
-                        "requested_quantity": item.quantity,
-                        "available_stock": product.stock,
+                        "requested_quantity":
+                            item.quantity,
+                        "available_stock":
+                            product.stock,
                     },
                 )
 
                 raise HTTPException(
                     status_code=400,
-                    detail=f"Insufficient stock for {product.productName}"
+                    detail=(
+                        f"Insufficient stock for "
+                        f"{product.productName}"
+                    )
                 )
 
             item_total = (
@@ -664,9 +676,11 @@ def approve_payment(request: PaymentApprovalRequest):
 
             validated_items.append({
                 "product_id": product.id,
-                "product_name": product.productName,
+                "product_name":
+                    product.productName,
                 "quantity": item.quantity,
-                "unit_price": float(product.price),
+                "unit_price":
+                    float(product.price),
             })
 
         # -----------------------------
@@ -677,16 +691,21 @@ def approve_payment(request: PaymentApprovalRequest):
             request.max_budget is not None
             and server_total > request.max_budget
         ):
-
             create_audit_log(
                 event_type="APPROVAL_BLOCKED",
                 status="BLOCKED",
                 reference_id=approval_attempt_id,
-                message="Purchase approval blocked because the cart exceeded the budget.",
+                message=(
+                    "Purchase approval blocked "
+                    "because the cart exceeded "
+                    "the budget."
+                ),
                 details={
                     "reason": "BUDGET_EXCEEDED",
-                    "server_total": round(server_total, 2),
-                    "max_budget": request.max_budget,
+                    "server_total":
+                        round(server_total, 2),
+                    "max_budget":
+                        request.max_budget,
                 },
             )
 
@@ -696,7 +715,7 @@ def approve_payment(request: PaymentApprovalRequest):
             )
 
         # -----------------------------
-        # Create approval
+        # Create persistent approval
         # -----------------------------
 
         approval_id = (
@@ -704,15 +723,40 @@ def approve_payment(request: PaymentApprovalRequest):
             + uuid.uuid4().hex
         )
 
-        payment_approvals[approval_id] = {
-            "items": validated_items,
-            "amount": round(server_total, 2),
-            "max_budget": request.max_budget,
-            "created_at": time.time(),
-            "expires_at": time.time() + 600,
-            "used": False,
-        }
+        created_at = (
+            datetime.now(timezone.utc)
+            .replace(tzinfo=None)
+        )
 
+        expires_at = (
+            created_at
+            + timedelta(minutes=10)
+        )
+
+        persistent_approval = (
+            models.PurchaseApproval(
+                approval_id=approval_id,
+                items=validated_items,
+                amount_rupees=round(
+                    server_total,
+                    2
+                ),
+                max_budget=request.max_budget,
+                used=False,
+                created_at=created_at,
+                expires_at=expires_at,
+            )
+        )
+
+        db.add(persistent_approval)
+        db.commit()
+        db.refresh(persistent_approval)
+
+        # -----------------------------
+        # Temporary memory cache
+        # -----------------------------
+        # Kept only while create-order
+        # is migrated to database storage.
         # -----------------------------
         # Audit successful approval
         # -----------------------------
@@ -724,23 +768,33 @@ def approve_payment(request: PaymentApprovalRequest):
             message="User approved the purchase.",
             details={
                 "items": validated_items,
-                "amount": round(server_total, 2),
-                "max_budget": request.max_budget,
+                "amount":
+                    round(server_total, 2),
+                "max_budget":
+                    request.max_budget,
                 "expires_in_seconds": 600,
+                "persistent": True,
             },
         )
 
         return {
             "approved": True,
             "approval_id": approval_id,
-            "amount": round(server_total, 2),
+            "amount": round(
+                server_total,
+                2
+            ),
             "expires_in_seconds": 600,
-            "message": "Purchase approval recorded"
+            "message":
+                "Purchase approval recorded"
         }
+
+    except Exception:
+        db.rollback()
+        raise
 
     finally:
         db.close()
-
 @app.post("/payment/create-order")
 def create_payment_order(request: PaymentOrderRequest):
     key_id = os.getenv("RAZORPAY_KEY_ID")
@@ -751,12 +805,14 @@ def create_payment_order(request: PaymentOrderRequest):
     # -----------------------------
 
     if not key_id or not key_secret:
-
         create_audit_log(
             event_type="ORDER_CREATION_FAILED",
             status="FAILED",
             reference_id=request.approval_id,
-            message="Payment order creation failed because Test credentials were unavailable.",
+            message=(
+                "Payment order creation failed "
+                "because Test credentials were unavailable."
+            ),
             details={
                 "reason": "TEST_CREDENTIALS_NOT_LOADED"
             },
@@ -768,12 +824,14 @@ def create_payment_order(request: PaymentOrderRequest):
         )
 
     if not key_id.startswith("rzp_test_"):
-
         create_audit_log(
             event_type="ORDER_CREATION_FAILED",
             status="BLOCKED",
             reference_id=request.approval_id,
-            message="Payment order creation blocked because Test Mode was not detected.",
+            message=(
+                "Payment order creation blocked "
+                "because Test Mode was not detected."
+            ),
             details={
                 "reason": "NON_TEST_KEY"
             },
@@ -784,80 +842,101 @@ def create_payment_order(request: PaymentOrderRequest):
             detail="Only Razorpay Test Mode is allowed"
         )
 
-    # -----------------------------
-    # Approval validation
-    # -----------------------------
-
-    approval = payment_approvals.get(
-        request.approval_id
-    )
-
-    if not approval:
-
-        create_audit_log(
-            event_type="PAYMENT_ORDER_BLOCKED",
-            status="BLOCKED",
-            reference_id=request.approval_id,
-            message="Payment order blocked because a valid purchase approval was not found.",
-            details={
-                "reason": "APPROVAL_NOT_FOUND"
-            },
-        )
-
-        raise HTTPException(
-            status_code=403,
-            detail="Valid purchase approval is required"
-        )
-
-    if approval["used"]:
-
-        create_audit_log(
-            event_type="APPROVAL_ALREADY_USED",
-            status="BLOCKED",
-            reference_id=request.approval_id,
-            message="Payment order blocked because the approval had already been used.",
-            details={
-                "reason": "APPROVAL_ALREADY_USED"
-            },
-        )
-
-        raise HTTPException(
-            status_code=409,
-            detail="This approval has already been used"
-        )
-
-    if time.time() > approval["expires_at"]:
-
-        payment_approvals.pop(
-            request.approval_id,
-            None
-        )
-
-        create_audit_log(
-            event_type="APPROVAL_EXPIRED",
-            status="BLOCKED",
-            reference_id=request.approval_id,
-            message="Payment order blocked because the purchase approval expired.",
-            details={
-                "reason": "APPROVAL_EXPIRED"
-            },
-        )
-
-        raise HTTPException(
-            status_code=403,
-            detail="Purchase approval has expired"
-        )
-
     db = SessionLocal()
 
     try:
+        # -----------------------------
+        # Load persistent approval
+        # -----------------------------
+
+        approval = (
+            db.query(models.PurchaseApproval)
+            .filter(
+                models.PurchaseApproval.approval_id
+                == request.approval_id
+            )
+            .first()
+        )
+
+        if not approval:
+            create_audit_log(
+                event_type="PAYMENT_ORDER_BLOCKED",
+                status="BLOCKED",
+                reference_id=request.approval_id,
+                message=(
+                    "Payment order blocked because "
+                    "a valid purchase approval was not found."
+                ),
+                details={
+                    "reason": "APPROVAL_NOT_FOUND"
+                },
+            )
+
+            raise HTTPException(
+                status_code=403,
+                detail="Valid purchase approval is required"
+            )
+
+        # -----------------------------
+        # Prevent approval reuse
+        # -----------------------------
+
+        if approval.used:
+            create_audit_log(
+                event_type="APPROVAL_ALREADY_USED",
+                status="BLOCKED",
+                reference_id=request.approval_id,
+                message=(
+                    "Payment order blocked because "
+                    "the approval had already been used."
+                ),
+                details={
+                    "reason": "APPROVAL_ALREADY_USED"
+                },
+            )
+
+            raise HTTPException(
+                status_code=409,
+                detail="This approval has already been used"
+            )
+
+        # -----------------------------
+        # Approval expiry
+        # -----------------------------
+
+        current_time = (
+            datetime.now(timezone.utc)
+            .replace(tzinfo=None)
+        )
+
+        if current_time > approval.expires_at:
+            create_audit_log(
+                event_type="APPROVAL_EXPIRED",
+                status="BLOCKED",
+                reference_id=request.approval_id,
+                message=(
+                    "Payment order blocked because "
+                    "the purchase approval expired."
+                ),
+                details={
+                    "reason": "APPROVAL_EXPIRED"
+                },
+            )
+
+            raise HTTPException(
+                status_code=403,
+                detail="Purchase approval has expired"
+            )
+
         current_total = 0.0
+
+        approval_items = approval.items or []
 
         # -----------------------------
         # Revalidate catalogue
         # -----------------------------
 
-        for item in approval["items"]:
+        for item in approval_items:
             product = (
                 db.query(models.Product)
                 .filter(
@@ -868,15 +947,18 @@ def create_payment_order(request: PaymentOrderRequest):
             )
 
             if not product:
-
                 create_audit_log(
                     event_type="PAYMENT_ORDER_BLOCKED",
                     status="BLOCKED",
                     reference_id=request.approval_id,
-                    message="Payment order blocked because a product no longer existed.",
+                    message=(
+                        "Payment order blocked because "
+                        "a product no longer existed."
+                    ),
                     details={
                         "reason": "PRODUCT_NOT_FOUND",
-                        "product_id": item["product_id"],
+                        "product_id":
+                            item["product_id"],
                     },
                 )
 
@@ -886,23 +968,30 @@ def create_payment_order(request: PaymentOrderRequest):
                 )
 
             if item["quantity"] > product.stock:
-
                 create_audit_log(
                     event_type="PAYMENT_ORDER_BLOCKED",
                     status="BLOCKED",
                     reference_id=request.approval_id,
-                    message="Payment order blocked because product stock changed.",
+                    message=(
+                        "Payment order blocked because "
+                        "product stock changed."
+                    ),
                     details={
                         "reason": "STOCK_CHANGED",
                         "product_id": product.id,
-                        "requested_quantity": item["quantity"],
-                        "available_stock": product.stock,
+                        "requested_quantity":
+                            item["quantity"],
+                        "available_stock":
+                            product.stock,
                     },
                 )
 
                 raise HTTPException(
                     status_code=400,
-                    detail=f"Stock changed for {product.productName}"
+                    detail=(
+                        f"Stock changed for "
+                        f"{product.productName}"
+                    )
                 )
 
             current_total += (
@@ -914,23 +1003,37 @@ def create_payment_order(request: PaymentOrderRequest):
         # Price revalidation
         # -----------------------------
 
-        if round(current_total, 2) != approval["amount"]:
+        approved_amount = float(
+            approval.amount_rupees
+        )
 
+        if round(current_total, 2) != round(
+            approved_amount,
+            2
+        ):
             create_audit_log(
                 event_type="PAYMENT_ORDER_BLOCKED",
                 status="BLOCKED",
                 reference_id=request.approval_id,
-                message="Payment order blocked because product pricing changed.",
+                message=(
+                    "Payment order blocked because "
+                    "product pricing changed."
+                ),
                 details={
                     "reason": "PRICE_CHANGED",
-                    "approved_amount": approval["amount"],
-                    "current_amount": round(current_total, 2),
+                    "approved_amount":
+                        approved_amount,
+                    "current_amount":
+                        round(current_total, 2),
                 },
             )
 
             raise HTTPException(
                 status_code=409,
-                detail="Product pricing changed. Approval must be repeated."
+                detail=(
+                    "Product pricing changed. "
+                    "Approval must be repeated."
+                )
             )
 
         # -----------------------------
@@ -965,26 +1068,22 @@ def create_payment_order(request: PaymentOrderRequest):
             + uuid.uuid4().hex
         )
 
-        payment_sessions[
-            payment_session_id
-        ] = {
-            "approval_id":
-                request.approval_id,
-            "razorpay_order_id":
-                razorpay_order["id"],
-            "amount":
-                razorpay_order["amount"],
-            "currency":
-                razorpay_order["currency"],
-            "receipt":
-                receipt,
-            "status":
-                "created",
-            "created_at":
-                time.time(),
-            "payment_id":
-                None,
-        }
+        # -----------------------------
+        # Save persistent payment session
+        # -----------------------------
+
+        persistent_session = models.PaymentSession(
+            payment_session_id=payment_session_id,
+            approval_id=request.approval_id,
+            razorpay_order_id=razorpay_order["id"],
+            razorpay_payment_id=None,
+            amount_paise=razorpay_order["amount"],
+            currency=razorpay_order["currency"],
+            receipt=receipt,
+            status="CREATED",
+        )
+
+        db.add(persistent_session)
 
         # -----------------------------
         # Save transaction permanently
@@ -999,33 +1098,44 @@ def create_payment_order(request: PaymentOrderRequest):
             currency=razorpay_order["currency"],
             receipt=receipt,
             status="CREATED",
-            items=approval["items"],
-            max_budget=approval["max_budget"],
+            items=approval_items,
+            max_budget=approval.max_budget,
             fulfilled=False,
             failure_reason=None,
         )
 
         db.add(transaction)
+
+        # -----------------------------
+        # Mark approval as consumed
+        # -----------------------------
+
+        approval.used = True
+
         db.commit()
+        db.refresh(persistent_session)
         db.refresh(transaction)
-
-        approval["used"] = True
-
-        # -----------------------------
-        # Audit successful order
-        # -----------------------------
-
         create_audit_log(
             event_type="PAYMENT_ORDER_CREATED",
             status="CREATED",
             reference_id=payment_session_id,
-            message="Razorpay Test payment order was created successfully.",
+            message=(
+                "Razorpay Test payment order "
+                "was created successfully."
+            ),
             details={
-                "approval_id": request.approval_id,
-                "razorpay_order_id": razorpay_order["id"],
-                "amount": razorpay_order["amount"],
-                "currency": razorpay_order["currency"],
-                "receipt": receipt,
+                "approval_id":
+                    request.approval_id,
+                "razorpay_order_id":
+                    razorpay_order["id"],
+                "amount":
+                    razorpay_order["amount"],
+                "currency":
+                    razorpay_order["currency"],
+                "receipt":
+                    receipt,
+                "persistent_session":
+                    True,
             },
         )
 
@@ -1045,12 +1155,16 @@ def create_payment_order(request: PaymentOrderRequest):
         }
 
     except razorpay.errors.BadRequestError:
+        db.rollback()
 
         create_audit_log(
             event_type="ORDER_CREATION_FAILED",
             status="FAILED",
             reference_id=request.approval_id,
-            message="Razorpay rejected the Test order creation request.",
+            message=(
+                "Razorpay rejected the "
+                "Test order creation request."
+            ),
             details={
                 "reason": "RAZORPAY_BAD_REQUEST"
             },
@@ -1058,8 +1172,19 @@ def create_payment_order(request: PaymentOrderRequest):
 
         raise HTTPException(
             status_code=400,
-            detail="Razorpay Test order could not be created"
+            detail=(
+                "Razorpay Test order "
+                "could not be created"
+            )
         )
+
+    except HTTPException:
+        db.rollback()
+        raise
+
+    except Exception:
+        db.rollback()
+        raise
 
     finally:
         db.close()
@@ -1074,12 +1199,14 @@ def verify_payment(request: PaymentVerifyRequest):
     # -----------------------------
 
     if not key_id or not key_secret:
-
         create_audit_log(
             event_type="PAYMENT_VERIFICATION_FAILED",
             status="FAILED",
             reference_id=request.payment_session_id,
-            message="Payment verification failed because Test credentials were unavailable.",
+            message=(
+                "Payment verification failed because "
+                "Test credentials were unavailable."
+            ),
             details={
                 "reason": "TEST_CREDENTIALS_NOT_LOADED"
             },
@@ -1091,12 +1218,14 @@ def verify_payment(request: PaymentVerifyRequest):
         )
 
     if not key_id.startswith("rzp_test_"):
-
         create_audit_log(
             event_type="PAYMENT_VERIFICATION_FAILED",
             status="BLOCKED",
             reference_id=request.payment_session_id,
-            message="Payment verification blocked because Test Mode was not detected.",
+            message=(
+                "Payment verification blocked because "
+                "Test Mode was not detected."
+            ),
             details={
                 "reason": "NON_TEST_KEY"
             },
@@ -1107,79 +1236,198 @@ def verify_payment(request: PaymentVerifyRequest):
             detail="Only Razorpay Test Mode is allowed"
         )
 
-    # -----------------------------
-    # Find server-side payment session
-    # -----------------------------
+    db = SessionLocal()
 
-    session = payment_sessions.get(
-        request.payment_session_id
-    )
+    try:
+        # -----------------------------
+        # Load persistent payment session
+        # -----------------------------
 
-    if not session:
-
-        create_audit_log(
-            event_type="PAYMENT_VERIFICATION_FAILED",
-            status="BLOCKED",
-            reference_id=request.payment_session_id,
-            message="Payment verification blocked because the payment session was not found.",
-            details={
-                "reason": "PAYMENT_SESSION_NOT_FOUND"
-            },
+        session = (
+            db.query(models.PaymentSession)
+            .filter(
+                models.PaymentSession.payment_session_id
+                == request.payment_session_id
+            )
+            .first()
         )
 
-        raise HTTPException(
-            status_code=404,
-            detail="Payment session not found"
+        if not session:
+            create_audit_log(
+                event_type="PAYMENT_VERIFICATION_FAILED",
+                status="BLOCKED",
+                reference_id=request.payment_session_id,
+                message=(
+                    "Payment verification blocked because "
+                    "the persistent payment session was not found."
+                ),
+                details={
+                    "reason": "PAYMENT_SESSION_NOT_FOUND"
+                },
+            )
+
+            raise HTTPException(
+                status_code=404,
+                detail="Payment session not found"
+            )
+
+        # -----------------------------
+        # Load persistent transaction
+        # -----------------------------
+
+        transaction = (
+            db.query(models.PaymentTransaction)
+            .filter(
+                models.PaymentTransaction.payment_session_id
+                == request.payment_session_id
+            )
+            .first()
         )
 
-    # Never trust browser order ID.
-    server_order_id = session[
-        "razorpay_order_id"
-    ]
+        if not transaction:
+            create_audit_log(
+                event_type="PAYMENT_VERIFICATION_FAILED",
+                status="BLOCKED",
+                reference_id=request.payment_session_id,
+                message=(
+                    "Payment verification blocked because "
+                    "the transaction record was not found."
+                ),
+                details={
+                    "reason": "TRANSACTION_NOT_FOUND"
+                },
+            )
 
-    # -----------------------------
-    # Order ID validation
-    # -----------------------------
+            raise HTTPException(
+                status_code=404,
+                detail="Payment transaction not found"
+            )
 
-    if (
-        request.razorpay_order_id
-        != server_order_id
-    ):
+        # Never trust browser order ID.
+        server_order_id = session.razorpay_order_id
 
-        create_audit_log(
-            event_type="PAYMENT_VERIFICATION_FAILED",
-            status="BLOCKED",
-            reference_id=request.payment_session_id,
-            message="Payment verification blocked because the order ID did not match the server record.",
-            details={
-                "reason": "ORDER_ID_MISMATCH"
-            },
-        )
-
-        raise HTTPException(
-            status_code=400,
-            detail="Order ID mismatch"
-        )
-
-    # -----------------------------
-    # Idempotency / replay protection
-    # -----------------------------
-
-    if (
-        request.razorpay_payment_id
-        in verified_payment_ids
-    ):
+        # -----------------------------
+        # Order ID validation
+        # -----------------------------
 
         if (
-            session["payment_id"]
+            request.razorpay_order_id
+            != server_order_id
+        ):
+            create_audit_log(
+                event_type="PAYMENT_VERIFICATION_FAILED",
+                status="BLOCKED",
+                reference_id=request.payment_session_id,
+                message=(
+                    "Payment verification blocked because "
+                    "the order ID did not match "
+                    "the server record."
+                ),
+                details={
+                    "reason": "ORDER_ID_MISMATCH"
+                },
+            )
+
+            raise HTTPException(
+                status_code=400,
+                detail="Order ID mismatch"
+            )
+
+        # -----------------------------
+        # Persistent replay protection
+        # -----------------------------
+
+        other_session = (
+            db.query(models.PaymentSession)
+            .filter(
+                models.PaymentSession.razorpay_payment_id
+                == request.razorpay_payment_id,
+                models.PaymentSession.payment_session_id
+                != request.payment_session_id,
+            )
+            .first()
+        )
+
+        other_transaction = (
+            db.query(models.PaymentTransaction)
+            .filter(
+                models.PaymentTransaction.razorpay_payment_id
+                == request.razorpay_payment_id,
+                models.PaymentTransaction.payment_session_id
+                != request.payment_session_id,
+            )
+            .first()
+        )
+
+        if other_session or other_transaction:
+            create_audit_log(
+                event_type="PAYMENT_REPLAY_BLOCKED",
+                status="BLOCKED",
+                reference_id=request.payment_session_id,
+                message=(
+                    "Payment verification blocked because "
+                    "the payment ID had already been used "
+                    "for another payment session."
+                ),
+                details={
+                    "reason": "PAYMENT_ID_ALREADY_USED"
+                },
+            )
+
+            raise HTTPException(
+                status_code=409,
+                detail="Payment ID has already been used"
+            )
+
+        # -----------------------------
+        # Prevent different payment ID
+        # replacing an existing one
+        # -----------------------------
+
+        if (
+            session.razorpay_payment_id
+            and session.razorpay_payment_id
+            != request.razorpay_payment_id
+        ):
+            create_audit_log(
+                event_type="PAYMENT_REPLAY_BLOCKED",
+                status="BLOCKED",
+                reference_id=request.payment_session_id,
+                message=(
+                    "Payment session was already linked "
+                    "to a different payment ID."
+                ),
+                details={
+                    "reason":
+                        "PAYMENT_SESSION_ALREADY_LINKED"
+                },
+            )
+
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Payment session is already linked "
+                    "to another payment"
+                )
+            )
+
+        # -----------------------------
+        # Completed idempotent retry
+        # -----------------------------
+
+        if (
+            transaction.fulfilled
+            and transaction.razorpay_payment_id
             == request.razorpay_payment_id
         ):
-
             create_audit_log(
                 event_type="PAYMENT_ALREADY_VERIFIED",
                 status="VERIFIED",
                 reference_id=request.payment_session_id,
-                message="Duplicate verification request safely returned the existing result.",
+                message=(
+                    "Duplicate verification request safely "
+                    "returned the existing fulfilled result."
+                ),
                 details={
                     "reason": "IDEMPOTENT_RETRY"
                 },
@@ -1192,410 +1440,408 @@ def verify_payment(request: PaymentVerifyRequest):
                     request.razorpay_payment_id,
                 "order_id":
                     server_order_id,
+                "razorpay_status":
+                    "captured",
+                "fulfillment_allowed": True,
+                "fulfillment_completed": True,
+                "message":
+                    "Payment was already verified and fulfilled",
             }
 
-        create_audit_log(
-            event_type="PAYMENT_REPLAY_BLOCKED",
-            status="BLOCKED",
-            reference_id=request.payment_session_id,
-            message="Payment verification blocked because the payment ID had already been used.",
-            details={
-                "reason": "PAYMENT_ID_ALREADY_USED"
-            },
+        # -----------------------------
+        # Signature verification
+        # -----------------------------
+
+        message = (
+            server_order_id
+            + "|"
+            + request.razorpay_payment_id
         )
 
-        raise HTTPException(
-            status_code=409,
-            detail="Payment ID has already been used"
+        expected_signature = hmac.new(
+            key_secret.encode("utf-8"),
+            message.encode("utf-8"),
+            hashlib.sha256
+        ).hexdigest()
+
+        signature_valid = hmac.compare_digest(
+            expected_signature,
+            request.razorpay_signature
         )
 
-    # -----------------------------
-    # Signature verification
-    # -----------------------------
-
-    message = (
-        server_order_id
-        + "|"
-        + request.razorpay_payment_id
-    )
-
-    expected_signature = hmac.new(
-        key_secret.encode("utf-8"),
-        message.encode("utf-8"),
-        hashlib.sha256
-    ).hexdigest()
-
-    signature_valid = hmac.compare_digest(
-        expected_signature,
-        request.razorpay_signature
-    )
-
-    if not signature_valid:
-
-        create_audit_log(
-            event_type="PAYMENT_VERIFICATION_FAILED",
-            status="BLOCKED",
-            reference_id=request.payment_session_id,
-            message="Payment verification blocked because signature verification failed.",
-            details={
-                "reason": "INVALID_SIGNATURE"
-            },
-        )
-
-        raise HTTPException(
-            status_code=400,
-            detail="Payment signature verification failed"
-        )
-
-    # -----------------------------
-    # Fetch payment from Razorpay
-    # -----------------------------
-
-    client = razorpay.Client(
-        auth=(key_id, key_secret)
-    )
-
-    try:
-        payment = client.payment.fetch(
-            request.razorpay_payment_id
-        )
-
-    except razorpay.errors.BadRequestError:
-
-        create_audit_log(
-            event_type="PAYMENT_VERIFICATION_FAILED",
-            status="FAILED",
-            reference_id=request.payment_session_id,
-            message="Payment could not be validated with Razorpay.",
-            details={
-                "reason": "RAZORPAY_PAYMENT_FETCH_FAILED"
-            },
-        )
-
-        raise HTTPException(
-            status_code=400,
-            detail="Could not validate payment with Razorpay"
-        )
-
-    # -----------------------------
-    # Server-to-server verification
-    # -----------------------------
-
-    if payment.get("order_id") != server_order_id:
-
-        create_audit_log(
-            event_type="PAYMENT_VERIFICATION_FAILED",
-            status="BLOCKED",
-            reference_id=request.payment_session_id,
-            message="Razorpay payment did not belong to the expected order.",
-            details={
-                "reason": "RAZORPAY_ORDER_MISMATCH"
-            },
-        )
-
-        raise HTTPException(
-            status_code=400,
-            detail="Razorpay payment does not belong to this order"
-        )
-
-    if payment.get("amount") != session["amount"]:
-
-        create_audit_log(
-            event_type="PAYMENT_VERIFICATION_FAILED",
-            status="BLOCKED",
-            reference_id=request.payment_session_id,
-            message="Payment verification blocked because the amount did not match.",
-            details={
-                "reason": "AMOUNT_MISMATCH",
-                "expected_amount": session["amount"],
-                "received_amount": payment.get("amount"),
-            },
-        )
-
-        raise HTTPException(
-            status_code=400,
-            detail="Payment amount mismatch"
-        )
-
-    if payment.get("currency") != session["currency"]:
-
-        create_audit_log(
-            event_type="PAYMENT_VERIFICATION_FAILED",
-            status="BLOCKED",
-            reference_id=request.payment_session_id,
-            message="Payment verification blocked because the currency did not match.",
-            details={
-                "reason": "CURRENCY_MISMATCH",
-                "expected_currency": session["currency"],
-                "received_currency": payment.get("currency"),
-            },
-        )
-
-        raise HTTPException(
-            status_code=400,
-            detail="Payment currency mismatch"
-        )
-
-    # -----------------------------
-    # Razorpay payment status
-    # -----------------------------
-
-    razorpay_status = payment.get("status")
-
-    verified_payment_ids.add(
-        request.razorpay_payment_id
-    )
-
-    session["payment_id"] = (
-        request.razorpay_payment_id
-    )
-
-    if razorpay_status == "captured":
-
-        session["status"] = "captured"
-
-        create_audit_log(
-            event_type="PAYMENT_VERIFIED",
-            status="CAPTURED",
-            reference_id=request.payment_session_id,
-            message="Razorpay Test payment was authenticated and captured successfully.",
-            details={
-                "razorpay_status": razorpay_status,
-                "amount": session["amount"],
-                "currency": session["currency"],
-                "fulfillment_allowed": True,
-            },
-        )
-
-    else:
-
-        session["status"] = "verified_not_captured"
-
-        create_audit_log(
-            event_type="PAYMENT_STATUS_NOT_CAPTURED",
-            status="PENDING",
-            reference_id=request.payment_session_id,
-            message="Payment was authenticated but was not in captured status.",
-            details={
-                "razorpay_status": razorpay_status,
-                "amount": session["amount"],
-                "currency": session["currency"],
-                "fulfillment_allowed": False,
-            },
-        )
-    # -----------------------------
-    # Persistent transaction + safe fulfilment
-    # -----------------------------
-
-    db = SessionLocal()
-    fulfillment_completed = False
-
-    try:
-        transaction = (
-            db.query(models.PaymentTransaction)
-            .filter(
-                models.PaymentTransaction.payment_session_id
-                == request.payment_session_id
+        if not signature_valid:
+            create_audit_log(
+                event_type="PAYMENT_VERIFICATION_FAILED",
+                status="BLOCKED",
+                reference_id=request.payment_session_id,
+                message=(
+                    "Payment verification blocked because "
+                    "signature verification failed."
+                ),
+                details={
+                    "reason": "INVALID_SIGNATURE"
+                },
             )
-            .first()
+
+            raise HTTPException(
+                status_code=400,
+                detail="Payment signature verification failed"
+            )
+
+        # -----------------------------
+        # Fetch payment from Razorpay
+        # -----------------------------
+
+        client = razorpay.Client(
+            auth=(key_id, key_secret)
         )
 
-        if transaction:
-            transaction.razorpay_payment_id = (
+        try:
+            payment = client.payment.fetch(
                 request.razorpay_payment_id
             )
 
-            # ---------------------------------
-            # Fulfil only captured payments
-            # ---------------------------------
+        except razorpay.errors.BadRequestError:
+            create_audit_log(
+                event_type="PAYMENT_VERIFICATION_FAILED",
+                status="FAILED",
+                reference_id=request.payment_session_id,
+                message=(
+                    "Payment could not be validated "
+                    "with Razorpay."
+                ),
+                details={
+                    "reason":
+                        "RAZORPAY_PAYMENT_FETCH_FAILED"
+                },
+            )
 
-            if razorpay_status == "captured":
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Could not validate payment "
+                    "with Razorpay"
+                )
+            )
 
-                # Already fulfilled = idempotent success
-                if transaction.fulfilled:
-                    transaction.status = "FULFILLED"
-                    transaction.failure_reason = None
-                    fulfillment_completed = True
+        # -----------------------------
+        # Server-to-server verification
+        # -----------------------------
 
-                    db.commit()
+        if payment.get("order_id") != server_order_id:
+            create_audit_log(
+                event_type="PAYMENT_VERIFICATION_FAILED",
+                status="BLOCKED",
+                reference_id=request.payment_session_id,
+                message=(
+                    "Razorpay payment did not belong "
+                    "to the expected order."
+                ),
+                details={
+                    "reason": "RAZORPAY_ORDER_MISMATCH"
+                },
+            )
 
-                else:
-                    transaction_items = (
-                        transaction.items or []
-                    )
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Razorpay payment does not belong "
+                    "to this order"
+                )
+            )
 
-                    # A paid transaction must contain items
-                    if not transaction_items:
-                        transaction.status = (
-                            "FULFILLMENT_BLOCKED"
-                        )
-                        transaction.failure_reason = (
-                            "EMPTY_TRANSACTION_ITEMS"
-                        )
+        if payment.get("amount") != session.amount_paise:
+            create_audit_log(
+                event_type="PAYMENT_VERIFICATION_FAILED",
+                status="BLOCKED",
+                reference_id=request.payment_session_id,
+                message=(
+                    "Payment verification blocked because "
+                    "the amount did not match."
+                ),
+                details={
+                    "reason": "AMOUNT_MISMATCH",
+                    "expected_amount":
+                        session.amount_paise,
+                    "received_amount":
+                        payment.get("amount"),
+                },
+            )
 
-                        db.commit()
+            raise HTTPException(
+                status_code=400,
+                detail="Payment amount mismatch"
+            )
 
-                        create_audit_log(
-                            event_type="FULFILLMENT_BLOCKED",
-                            status="BLOCKED",
-                            reference_id=(
-                                request.payment_session_id
-                            ),
-                            message=(
-                                "Order fulfilment was blocked "
-                                "because the transaction contained "
-                                "no items."
-                            ),
-                            details={
-                                "reason":
-                                    "EMPTY_TRANSACTION_ITEMS"
-                            },
-                        )
+        if payment.get("currency") != session.currency:
+            create_audit_log(
+                event_type="PAYMENT_VERIFICATION_FAILED",
+                status="BLOCKED",
+                reference_id=request.payment_session_id,
+                message=(
+                    "Payment verification blocked because "
+                    "the currency did not match."
+                ),
+                details={
+                    "reason": "CURRENCY_MISMATCH",
+                    "expected_currency":
+                        session.currency,
+                    "received_currency":
+                        payment.get("currency"),
+                },
+            )
 
-                    else:
-                        products_to_update = []
-                        fulfillment_error = None
+            raise HTTPException(
+                status_code=400,
+                detail="Payment currency mismatch"
+            )
 
-                        # Validate every item BEFORE
-                        # changing any stock
-                        for item in transaction_items:
-                            product_id = item.get(
-                                "product_id"
-                            )
+        # -----------------------------
+        # Razorpay payment status
+        # -----------------------------
 
-                            quantity = int(
-                                item.get("quantity", 0)
-                            )
+        razorpay_status = payment.get("status")
 
-                            if quantity <= 0:
-                                fulfillment_error = (
-                                    "INVALID_QUANTITY"
-                                )
-                                break
+        fulfillment_completed = False
+        fulfillment_error = None
 
-                            product = (
-                                db.query(models.Product)
-                                .filter(
-                                    models.Product.id
-                                    == product_id
-                                )
-                                .first()
-                            )
+        # Persistent payment IDs
+        session.razorpay_payment_id = (
+            request.razorpay_payment_id
+        )
 
-                            if not product:
-                                fulfillment_error = (
-                                    "PRODUCT_NOT_FOUND"
-                                )
-                                break
+        transaction.razorpay_payment_id = (
+            request.razorpay_payment_id
+        )
 
-                            if product.stock < quantity:
-                                fulfillment_error = (
-                                    "INSUFFICIENT_STOCK"
-                                )
-                                break
+        # -----------------------------
+        # Captured payment
+        # -----------------------------
 
-                            products_to_update.append(
-                                (product, quantity)
-                            )
+        if razorpay_status == "captured":
+            transaction_items = (
+                transaction.items or []
+            )
 
-                        # -------------------------
-                        # Block fulfilment safely
-                        # -------------------------
-
-                        if fulfillment_error:
-                            transaction.status = (
-                                "FULFILLMENT_BLOCKED"
-                            )
-                            transaction.failure_reason = (
-                                fulfillment_error
-                            )
-
-                            db.commit()
-
-                            create_audit_log(
-                                event_type="FULFILLMENT_BLOCKED",
-                                status="BLOCKED",
-                                reference_id=(
-                                    request.payment_session_id
-                                ),
-                                message=(
-                                    "Order fulfilment was blocked "
-                                    "after payment verification."
-                                ),
-                                details={
-                                    "reason":
-                                        fulfillment_error
-                                },
-                            )
-
-                        # -------------------------
-                        # Commit stock reduction
-                        # -------------------------
-
-                        else:
-                            for (
-                                product,
-                                quantity,
-                            ) in products_to_update:
-                                product.stock -= quantity
-
-                            transaction.fulfilled = True
-                            transaction.status = "FULFILLED"
-                            transaction.failure_reason = None
-
-                            db.commit()
-
-                            fulfillment_completed = True
-
-                            create_audit_log(
-                                event_type="ORDER_FULFILLED",
-                                status="FULFILLED",
-                                reference_id=(
-                                    request.payment_session_id
-                                ),
-                                message=(
-                                    "Verified Test payment was "
-                                    "fulfilled and inventory was "
-                                    "updated successfully."
-                                ),
-                                details={
-                                    "item_count":
-                                        len(
-                                            transaction_items
-                                        )
-                                },
-                            )
-
-            # ---------------------------------
-            # Verified but not captured
-            # ---------------------------------
+            if not transaction_items:
+                fulfillment_error = (
+                    "EMPTY_TRANSACTION_ITEMS"
+                )
 
             else:
+                products_to_update = []
+
+                # Validate all inventory first
+                for item in transaction_items:
+                    product_id = item.get(
+                        "product_id"
+                    )
+
+                    quantity = int(
+                        item.get("quantity", 0)
+                    )
+
+                    if quantity <= 0:
+                        fulfillment_error = (
+                            "INVALID_QUANTITY"
+                        )
+                        break
+
+                    product = (
+                        db.query(models.Product)
+                        .filter(
+                            models.Product.id
+                            == product_id
+                        )
+                        .first()
+                    )
+
+                    if not product:
+                        fulfillment_error = (
+                            "PRODUCT_NOT_FOUND"
+                        )
+                        break
+
+                    if product.stock < quantity:
+                        fulfillment_error = (
+                            "INSUFFICIENT_STOCK"
+                        )
+                        break
+
+                    products_to_update.append(
+                        (product, quantity)
+                    )
+
+            # -------------------------
+            # Fulfilment blocked
+            # -------------------------
+
+            if fulfillment_error:
+                session.status = "CAPTURED"
+
                 transaction.status = (
-                    "VERIFIED_NOT_CAPTURED"
+                    "FULFILLMENT_BLOCKED"
                 )
-                transaction.failure_reason = None
+
+                transaction.failure_reason = (
+                    fulfillment_error
+                )
 
                 db.commit()
 
+                create_audit_log(
+                    event_type="PAYMENT_VERIFIED",
+                    status="CAPTURED",
+                    reference_id=request.payment_session_id,
+                    message=(
+                        "Razorpay Test payment was "
+                        "authenticated and captured."
+                    ),
+                    details={
+                        "razorpay_status":
+                            razorpay_status,
+                        "amount":
+                            session.amount_paise,
+                        "currency":
+                            session.currency,
+                        "fulfillment_allowed":
+                            True,
+                    },
+                )
+
+                create_audit_log(
+                    event_type="FULFILLMENT_BLOCKED",
+                    status="BLOCKED",
+                    reference_id=request.payment_session_id,
+                    message=(
+                        "Order fulfilment was blocked "
+                        "after payment verification."
+                    ),
+                    details={
+                        "reason": fulfillment_error
+                    },
+                )
+
+            # -------------------------
+            # Successful fulfilment
+            # -------------------------
+
+            else:
+                for (
+                    product,
+                    quantity,
+                ) in products_to_update:
+                    product.stock -= quantity
+
+                transaction.fulfilled = True
+                transaction.status = "FULFILLED"
+                transaction.failure_reason = None
+
+                session.status = "FULFILLED"
+
+                db.commit()
+
+                fulfillment_completed = True
+
+                create_audit_log(
+                    event_type="PAYMENT_VERIFIED",
+                    status="CAPTURED",
+                    reference_id=request.payment_session_id,
+                    message=(
+                        "Razorpay Test payment was "
+                        "authenticated and captured "
+                        "successfully."
+                    ),
+                    details={
+                        "razorpay_status":
+                            razorpay_status,
+                        "amount":
+                            session.amount_paise,
+                        "currency":
+                            session.currency,
+                        "fulfillment_allowed":
+                            True,
+                    },
+                )
+
+                create_audit_log(
+                    event_type="ORDER_FULFILLED",
+                    status="FULFILLED",
+                    reference_id=request.payment_session_id,
+                    message=(
+                        "Verified Test payment was "
+                        "fulfilled and inventory was "
+                        "updated successfully."
+                    ),
+                    details={
+                        "item_count":
+                            len(transaction_items)
+                    },
+                )
+
+        # -----------------------------
+        # Verified but not captured
+        # -----------------------------
+
+        else:
+            session.status = (
+                "VERIFIED_NOT_CAPTURED"
+            )
+
+            transaction.status = (
+                "VERIFIED_NOT_CAPTURED"
+            )
+
+            transaction.failure_reason = None
+
+            db.commit()
+
+            create_audit_log(
+                event_type="PAYMENT_STATUS_NOT_CAPTURED",
+                status="PENDING",
+                reference_id=request.payment_session_id,
+                message=(
+                    "Payment was authenticated but "
+                    "was not in captured status."
+                ),
+                details={
+                    "razorpay_status":
+                        razorpay_status,
+                    "amount":
+                        session.amount_paise,
+                    "currency":
+                        session.currency,
+                    "fulfillment_allowed":
+                        False,
+                },
+            )
+
+        return {
+            "verified": True,
+            "payment_id":
+                request.razorpay_payment_id,
+            "order_id":
+                server_order_id,
+            "razorpay_status":
+                razorpay_status,
+            "fulfillment_allowed":
+                razorpay_status == "captured",
+            "fulfillment_completed":
+                fulfillment_completed,
+            "message":
+                "Razorpay Test payment authenticated successfully",
+        }
+
+    except HTTPException:
+        db.rollback()
+        raise
+
+    except Exception:
+        db.rollback()
+        raise
+
     finally:
         db.close()
-
-    return {
-        "verified": True,
-        "payment_id":
-            request.razorpay_payment_id,
-        "order_id":
-            server_order_id,
-        "razorpay_status":
-            razorpay_status,
-        "fulfillment_allowed":
-            razorpay_status == "captured",
-        "fulfillment_completed":
-            fulfillment_completed,
-        "message":
-            "Razorpay Test payment authenticated successfully",
-    }
 @app.post("/growth/suggestions")
 def get_growth_suggestions(request: PolicyRequest):
     db = SessionLocal()

@@ -1,5 +1,28 @@
 import { useEffect, useState } from "react";
 import { getPaymentTransactions } from "../services/api";
+const formatUtcToIst = (value) => {
+  if (!value) return "—";
+
+  const utcValue =
+    value.endsWith("Z") ||
+    value.includes("+")
+      ? value
+      : `${value}Z`;
+
+  return new Date(utcValue).toLocaleString(
+    "en-IN",
+    {
+      timeZone: "Asia/Kolkata",
+      day: "2-digit",
+      month: "2-digit",
+      year: "numeric",
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+      hour12: false,
+    }
+  );
+};
 
 export default function Transactions() {
   const [transactions, setTransactions] = useState([]);
@@ -138,11 +161,7 @@ export default function Transactions() {
                   </td>
 
                   <td className="px-5 py-4 text-sm">
-                    {transaction.created_at
-                      ? new Date(
-                          transaction.created_at
-                        ).toLocaleString()
-                      : "—"}
+                    {formatUtcToIst(transaction.created_at)}
                   </td>
                 </tr>
               ))}
