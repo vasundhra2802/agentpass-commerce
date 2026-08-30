@@ -1383,12 +1383,12 @@ def verify_payment(request: PaymentVerifyRequest):
                 "fulfillment_allowed": False,
             },
         )
-
     # -----------------------------
-    # Update persistent transaction
+    # Persistent transaction + safe fulfilment
     # -----------------------------
 
     db = SessionLocal()
+    fulfillment_completed = False
 
     try:
         transaction = (
@@ -1405,26 +1405,196 @@ def verify_payment(request: PaymentVerifyRequest):
                 request.razorpay_payment_id
             )
 
+            # ---------------------------------
+            # Fulfil only captured payments
+            # ---------------------------------
+
             if razorpay_status == "captured":
-                transaction.status = "CAPTURED"
+
+                # Already fulfilled = idempotent success
+                if transaction.fulfilled:
+                    transaction.status = "FULFILLED"
+                    transaction.failure_reason = None
+                    fulfillment_completed = True
+
+                    db.commit()
+
+                else:
+                    transaction_items = (
+                        transaction.items or []
+                    )
+
+                    # A paid transaction must contain items
+                    if not transaction_items:
+                        transaction.status = (
+                            "FULFILLMENT_BLOCKED"
+                        )
+                        transaction.failure_reason = (
+                            "EMPTY_TRANSACTION_ITEMS"
+                        )
+
+                        db.commit()
+
+                        create_audit_log(
+                            event_type="FULFILLMENT_BLOCKED",
+                            status="BLOCKED",
+                            reference_id=(
+                                request.payment_session_id
+                            ),
+                            message=(
+                                "Order fulfilment was blocked "
+                                "because the transaction contained "
+                                "no items."
+                            ),
+                            details={
+                                "reason":
+                                    "EMPTY_TRANSACTION_ITEMS"
+                            },
+                        )
+
+                    else:
+                        products_to_update = []
+                        fulfillment_error = None
+
+                        # Validate every item BEFORE
+                        # changing any stock
+                        for item in transaction_items:
+                            product_id = item.get(
+                                "product_id"
+                            )
+
+                            quantity = int(
+                                item.get("quantity", 0)
+                            )
+
+                            if quantity <= 0:
+                                fulfillment_error = (
+                                    "INVALID_QUANTITY"
+                                )
+                                break
+
+                            product = (
+                                db.query(models.Product)
+                                .filter(
+                                    models.Product.id
+                                    == product_id
+                                )
+                                .first()
+                            )
+
+                            if not product:
+                                fulfillment_error = (
+                                    "PRODUCT_NOT_FOUND"
+                                )
+                                break
+
+                            if product.stock < quantity:
+                                fulfillment_error = (
+                                    "INSUFFICIENT_STOCK"
+                                )
+                                break
+
+                            products_to_update.append(
+                                (product, quantity)
+                            )
+
+                        # -------------------------
+                        # Block fulfilment safely
+                        # -------------------------
+
+                        if fulfillment_error:
+                            transaction.status = (
+                                "FULFILLMENT_BLOCKED"
+                            )
+                            transaction.failure_reason = (
+                                fulfillment_error
+                            )
+
+                            db.commit()
+
+                            create_audit_log(
+                                event_type="FULFILLMENT_BLOCKED",
+                                status="BLOCKED",
+                                reference_id=(
+                                    request.payment_session_id
+                                ),
+                                message=(
+                                    "Order fulfilment was blocked "
+                                    "after payment verification."
+                                ),
+                                details={
+                                    "reason":
+                                        fulfillment_error
+                                },
+                            )
+
+                        # -------------------------
+                        # Commit stock reduction
+                        # -------------------------
+
+                        else:
+                            for (
+                                product,
+                                quantity,
+                            ) in products_to_update:
+                                product.stock -= quantity
+
+                            transaction.fulfilled = True
+                            transaction.status = "FULFILLED"
+                            transaction.failure_reason = None
+
+                            db.commit()
+
+                            fulfillment_completed = True
+
+                            create_audit_log(
+                                event_type="ORDER_FULFILLED",
+                                status="FULFILLED",
+                                reference_id=(
+                                    request.payment_session_id
+                                ),
+                                message=(
+                                    "Verified Test payment was "
+                                    "fulfilled and inventory was "
+                                    "updated successfully."
+                                ),
+                                details={
+                                    "item_count":
+                                        len(
+                                            transaction_items
+                                        )
+                                },
+                            )
+
+            # ---------------------------------
+            # Verified but not captured
+            # ---------------------------------
+
             else:
-                transaction.status = "VERIFIED_NOT_CAPTURED"
+                transaction.status = (
+                    "VERIFIED_NOT_CAPTURED"
+                )
+                transaction.failure_reason = None
 
-            transaction.failure_reason = None
-
-            db.commit()
+                db.commit()
 
     finally:
         db.close()
 
     return {
         "verified": True,
-        "payment_id": request.razorpay_payment_id,
-        "order_id": server_order_id,
-        "razorpay_status": razorpay_status,
-        "fulfillment_allowed": razorpay_status == "captured",
-        "message": "Razorpay Test payment authenticated successfully",
-
+        "payment_id":
+            request.razorpay_payment_id,
+        "order_id":
+            server_order_id,
+        "razorpay_status":
+            razorpay_status,
+        "fulfillment_allowed":
+            razorpay_status == "captured",
+        "fulfillment_completed":
+            fulfillment_completed,
+        "message":
+            "Razorpay Test payment authenticated successfully",
     }
 @app.post("/growth/suggestions")
 def get_growth_suggestions(request: PolicyRequest):
