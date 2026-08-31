@@ -6,6 +6,7 @@ from fastapi.middleware.cors import CORSMiddleware
 import re
 import models
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal, ROUND_HALF_UP
 import os
 import time
 import hmac
@@ -77,11 +78,13 @@ class CartItemRequest(BaseModel):
 class PolicyRequest(BaseModel):
     items: list[CartItemRequest]
     max_budget: float | None = None
+    quote_id: str | None = None
 
 
 class PaymentApprovalRequest(BaseModel):
     items: list[CartItemRequest]
     max_budget: float | None = None
+    quote_id: str | None = None
 
 
 class PaymentOrderRequest(BaseModel):
@@ -93,6 +96,16 @@ class PaymentVerifyRequest(BaseModel):
     razorpay_order_id: str
     razorpay_payment_id: str
     razorpay_signature: str
+
+
+
+class CheckoutQuoteRequest(BaseModel):
+    items: list[CartItemRequest]
+    max_budget: float | None = None
+    social_contribution_rupees: float = 0.0
+    social_cause: str | None = None
+    delivery_zone: str = "LOCAL"
+
 
 app = FastAPI()
 app.add_middleware(
@@ -331,27 +344,499 @@ def update_product(product_id: int, updated_product: Product):
     finally:
         db.close()
 
+
+
+# =========================================================
+# CHECKOUT PRICING / QUOTE
+# =========================================================
+
+def _utc_now_naive():
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+def _offer_matches_product(offer, product, order_subtotal, now):
+    if not offer.active:
+        return False
+
+    if offer.starts_at and now < offer.starts_at:
+        return False
+
+    if offer.ends_at and now > offer.ends_at:
+        return False
+
+    if (
+        offer.min_order_value is not None
+        and order_subtotal < float(offer.min_order_value)
+    ):
+        return False
+
+    if (
+        offer.product_id is not None
+        and offer.product_id != product.id
+    ):
+        return False
+
+    if offer.brand is not None:
+        product_brand = (product.brand or "").strip().lower()
+        if product_brand != offer.brand.strip().lower():
+            return False
+
+    if offer.category is not None:
+        product_category = (product.category or "").strip().lower()
+        if product_category != offer.category.strip().lower():
+            return False
+
+    return True
+
+
+def _money(value):
+    return float(
+        Decimal(str(value)).quantize(
+            Decimal("0.01"),
+            rounding=ROUND_HALF_UP
+        )
+    )
+
+
+def _calculate_offer_discount(offer, line_total):
+    discount_type = (offer.discount_type or "").strip().upper()
+    discount_value = max(0.0, float(offer.discount_value or 0.0))
+
+    if discount_type == "PERCENTAGE":
+        discount = line_total * min(discount_value, 100.0) / 100.0
+    elif discount_type == "FLAT":
+        discount = discount_value
+    else:
+        return 0.0
+
+    if offer.max_discount is not None:
+        discount = min(discount, max(0.0, float(offer.max_discount)))
+
+    return _money(min(discount, line_total))
+
+
+def _find_tax_rule(db, product, now):
+    rules = (
+        db.query(models.TaxRule)
+        .filter(models.TaxRule.active.is_(True))
+        .all()
+    )
+
+    best_rule = None
+    best_score = -1
+
+    product_category = (product.category or "").strip().lower()
+    product_subcategory = (product.subcategory or "").strip().lower()
+
+    for rule in rules:
+        if rule.effective_from and now < rule.effective_from:
+            continue
+
+        if rule.effective_to and now > rule.effective_to:
+            continue
+
+        rule_category = (rule.category or "").strip().lower()
+        rule_subcategory = (rule.subcategory or "").strip().lower()
+
+        if rule_category and rule_category != product_category:
+            continue
+
+        if rule_subcategory and rule_subcategory != product_subcategory:
+            continue
+
+        score = 0
+        if rule_category:
+            score += 1
+        if rule_subcategory:
+            score += 2
+
+        if score > best_score:
+            best_rule = rule
+            best_score = score
+
+    return best_rule
+
+
+def _request_item_signature(items):
+    return sorted(
+        (int(item.product_id), int(item.quantity))
+        for item in items
+    )
+
+
+def _quote_item_signature(quote_items):
+    return sorted(
+        (
+            int(item.get("product_id")),
+            int(item.get("quantity", 0))
+        )
+        for item in (quote_items or [])
+    )
+
+
+def _load_checkout_quote(db, quote_id):
+    if not quote_id:
+        return None
+
+    quote = (
+        db.query(models.CheckoutQuote)
+        .filter(models.CheckoutQuote.quote_id == quote_id)
+        .first()
+    )
+
+    if not quote:
+        raise HTTPException(
+            status_code=404,
+            detail="Checkout quote not found"
+        )
+
+    return quote
+
+
+@app.post("/checkout/quote")
+def create_checkout_quote(request: CheckoutQuoteRequest):
+    db = SessionLocal()
+    quote_reference_id = f"quote_{uuid.uuid4().hex}"
+
+    try:
+        if not request.items:
+            raise HTTPException(
+                status_code=400,
+                detail="Cart is empty"
+            )
+
+        contribution = _money(
+            request.social_contribution_rupees or 0.0
+        )
+
+        if contribution < 0 or contribution > 10000:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Social contribution must be between "
+                    "₹0 and ₹10,000"
+                )
+            )
+
+        allowed_causes = {
+            "EDUCATION",
+            "FOOD",
+            "HEALTHCARE",
+        }
+
+        normalized_cause = (
+            request.social_cause.strip().upper()
+            if request.social_cause
+            else None
+        )
+
+        if contribution > 0:
+            if normalized_cause not in allowed_causes:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "Select Education, Food, or Healthcare "
+                        "for the social contribution"
+                    )
+                )
+        else:
+            normalized_cause = None
+
+        now = _utc_now_naive()
+        validated_rows = []
+        subtotal = 0.0
+
+        # First pass: validate the cart and calculate server subtotal.
+        for item in request.items:
+            if item.quantity <= 0:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Invalid quantity"
+                )
+
+            product = (
+                db.query(models.Product)
+                .filter(models.Product.id == item.product_id)
+                .first()
+            )
+
+            if not product:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"Product {item.product_id} not found"
+                )
+
+            if item.quantity > product.stock:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"Insufficient stock for {product.productName}"
+                    )
+                )
+
+            unit_price = _money(product.price)
+            line_subtotal = _money(
+                Decimal(str(unit_price))
+                * Decimal(str(item.quantity))
+            )
+            subtotal += line_subtotal
+
+            validated_rows.append({
+                "product": product,
+                "quantity": item.quantity,
+                "unit_price": unit_price,
+                "line_subtotal": line_subtotal,
+            })
+
+        subtotal = _money(subtotal)
+
+        active_offers = (
+            db.query(models.OfferCampaign)
+            .filter(models.OfferCampaign.active.is_(True))
+            .all()
+        )
+
+        pricing_lines = []
+        total_discount = 0.0
+        total_tax = 0.0
+
+        # Second pass: apply one best non-stacking offer per item,
+        # then calculate configured tax on the discounted line value.
+        for row in validated_rows:
+            product = row["product"]
+            line_subtotal = row["line_subtotal"]
+
+            best_offer = None
+            best_discount = 0.0
+
+            for offer in active_offers:
+                if not _offer_matches_product(
+                    offer,
+                    product,
+                    subtotal,
+                    now
+                ):
+                    continue
+
+                candidate_discount = _calculate_offer_discount(
+                    offer,
+                    line_subtotal
+                )
+
+                if candidate_discount > best_discount:
+                    best_discount = candidate_discount
+                    best_offer = offer
+
+            discounted_line = _money(
+                max(
+                    0.0,
+                    line_subtotal - best_discount
+                )
+            )
+
+            tax_rule = _find_tax_rule(db, product, now)
+            tax_rate = (
+                max(0.0, float(tax_rule.rate_percent))
+                if tax_rule
+                else 0.0
+            )
+            line_tax = _money(
+                Decimal(str(discounted_line))
+                * Decimal(str(tax_rate))
+                / Decimal("100")
+            )
+
+            total_discount += best_discount
+            total_tax += line_tax
+
+            pricing_lines.append({
+                "product_id": product.id,
+                "product_name": product.productName,
+                "category": product.category,
+                "subcategory": product.subcategory,
+                "quantity": row["quantity"],
+                "unit_price": row["unit_price"],
+                "line_subtotal": line_subtotal,
+                "offer": (
+                    {
+                        "offer_id": best_offer.id,
+                        "name": best_offer.name,
+                        "discount_type": best_offer.discount_type,
+                        "discount_value": best_offer.discount_value,
+                        "discount_rupees": best_discount,
+                    }
+                    if best_offer
+                    else None
+                ),
+                "discount_rupees": best_discount,
+                "tax_rule": (
+                    {
+                        "tax_rule_id": tax_rule.id,
+                        "name": tax_rule.name,
+                        "rate_percent": tax_rate,
+                    }
+                    if tax_rule
+                    else None
+                ),
+                "taxable_value": discounted_line,
+                "tax_rupees": line_tax,
+                "line_total": _money(
+                    discounted_line + line_tax
+                ),
+            })
+
+        total_discount = _money(total_discount)
+        total_tax = _money(total_tax)
+
+        # Demo delivery pricing.
+        # In production, this zone should be derived server-side from
+        # the validated delivery address/postcode instead of trusting
+        # a browser-supplied distance claim.
+        normalized_delivery_zone = (
+            str(request.delivery_zone or "LOCAL")
+            .strip()
+            .upper()
+        )
+
+        shipping_by_zone = {
+            "LOCAL": 0.0,
+            "STANDARD": 50.0,
+            "FAR": 100.0,
+        }
+
+        if normalized_delivery_zone not in shipping_by_zone:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Delivery zone must be LOCAL, STANDARD, or FAR"
+                )
+            )
+
+        shipping = shipping_by_zone[normalized_delivery_zone]
+
+        grand_total = _money(
+            Decimal(str(subtotal))
+            - Decimal(str(total_discount))
+            + Decimal(str(total_tax))
+            + Decimal(str(shipping))
+            + Decimal(str(contribution))
+        )
+
+        budget_passed = (
+            request.max_budget is None
+            or grand_total <= request.max_budget
+        )
+
+        expires_at = now + timedelta(minutes=10)
+
+        quote = models.CheckoutQuote(
+            quote_id=quote_reference_id,
+            approval_id=None,
+            items=[
+                {
+                    "product_id": line["product_id"],
+                    "product_name": line["product_name"],
+                    "quantity": line["quantity"],
+                    "unit_price": line["unit_price"],
+                }
+                for line in pricing_lines
+            ],
+            subtotal_rupees=subtotal,
+            discount_rupees=total_discount,
+            tax_rupees=total_tax,
+            shipping_rupees=shipping,
+            social_contribution_rupees=contribution,
+            social_cause=normalized_cause,
+            grand_total_rupees=grand_total,
+            max_budget=request.max_budget,
+            pricing_details={
+                "lines": pricing_lines,
+                "budget_passed": budget_passed,
+                "tax_basis": "CONFIGURED_TAX_RULES",
+                "offer_stacking": False,
+                "delivery_zone": normalized_delivery_zone,
+                "shipping_rule": "DEMO_ZONE_BASED",
+            },
+            status="QUOTED",
+            created_at=now,
+            expires_at=expires_at,
+        )
+
+        db.add(quote)
+        db.commit()
+        db.refresh(quote)
+
+        create_audit_log(
+            event_type="CHECKOUT_QUOTED",
+            status=(
+                "QUOTED"
+                if budget_passed
+                else "OVER_BUDGET"
+            ),
+            reference_id=quote_reference_id,
+            message="Server-side checkout quote created.",
+            details={
+                "subtotal": subtotal,
+                "discount": total_discount,
+                "tax": total_tax,
+                "shipping": shipping,
+                "delivery_zone": normalized_delivery_zone,
+                "social_contribution": contribution,
+                "grand_total": grand_total,
+                "max_budget": request.max_budget,
+                "budget_passed": budget_passed,
+            },
+        )
+
+        return {
+            "quote_id": quote_reference_id,
+            "status": quote.status,
+            "expires_in_seconds": 600,
+            "items": pricing_lines,
+            "subtotal": subtotal,
+            "discount": total_discount,
+            "tax": total_tax,
+            "shipping": shipping,
+            "delivery_zone": normalized_delivery_zone,
+            "social_contribution": contribution,
+            "social_cause": normalized_cause,
+            "grand_total": grand_total,
+            "max_budget": request.max_budget,
+            "budget_passed": budget_passed,
+            "message": (
+                "Checkout quote created successfully"
+                if budget_passed
+                else "Checkout quote exceeds the detected budget"
+            ),
+        }
+
+    except HTTPException:
+        db.rollback()
+        raise
+
+    except Exception:
+        db.rollback()
+        raise
+
+    finally:
+        db.close()
+
 @app.post("/policy/check")
 def check_policy(request: PolicyRequest):
     db = SessionLocal()
 
-    # Every policy decision gets its own reference ID
     policy_reference_id = f"policy_{uuid.uuid4().hex[:12]}"
 
     try:
         checks = []
-        server_total = 0.0
 
         stock_passed = True
         quantity_passed = True
         catalogue_passed = True
-
-        # -----------------------------
-        # Empty cart check
-        # -----------------------------
+        price_lock_passed = True
+        quote_passed = True
 
         if not request.items:
-
             create_audit_log(
                 event_type="POLICY_BLOCKED",
                 status="BLOCKED",
@@ -361,6 +846,7 @@ def check_policy(request: PolicyRequest):
                     "server_total": 0,
                     "max_budget": request.max_budget,
                     "reason": "EMPTY_CART",
+                    "quote_id": request.quote_id,
                 },
             )
 
@@ -369,130 +855,202 @@ def check_policy(request: PolicyRequest):
                 "decision": "BLOCKED",
                 "server_total": 0,
                 "reference_id": policy_reference_id,
+                "quote_id": request.quote_id,
                 "checks": [
                     {
                         "name": "Cart Check",
                         "passed": False,
-                        "message": "Cart is empty"
+                        "message": "Cart is empty",
                     }
-                ]
+                ],
             }
 
-        # -----------------------------
-        # Validate every cart item
-        # -----------------------------
+        quote = _load_checkout_quote(
+            db,
+            request.quote_id
+        )
+
+        authoritative_budget = request.max_budget
+        server_total = 0.0
+
+        if quote:
+            now = _utc_now_naive()
+
+            if now > quote.expires_at:
+                quote_passed = False
+
+            if quote.status not in {
+                "QUOTED",
+                "APPROVED",
+            }:
+                quote_passed = False
+
+            if (
+                _request_item_signature(request.items)
+                != _quote_item_signature(quote.items)
+            ):
+                quote_passed = False
+
+            authoritative_budget = quote.max_budget
+            server_total = round(
+                float(quote.grand_total_rupees),
+                2
+            )
+
+            checks.append({
+                "name": "Checkout Quote Check",
+                "passed": quote_passed,
+                "message": (
+                    "Server checkout quote is valid and matches the cart"
+                    if quote_passed
+                    else "Checkout quote is expired, changed, or does not match the cart"
+                ),
+            })
+
+        quote_items_by_id = {
+            int(item.get("product_id")): item
+            for item in (quote.items or [])
+        } if quote else {}
+
+        base_catalogue_total = 0.0
 
         for item in request.items:
             product = (
                 db.query(models.Product)
-                .filter(
-                    models.Product.id
-                    == item.product_id
-                )
+                .filter(models.Product.id == item.product_id)
                 .first()
             )
 
-            # Product must exist
             if not product:
                 catalogue_passed = False
                 continue
 
-            # Quantity must be valid
             if item.quantity <= 0:
                 quantity_passed = False
                 continue
 
-            # Quantity cannot exceed stock
             if item.quantity > product.stock:
                 stock_passed = False
 
-            server_total += (
-                float(product.price)
+            current_unit_price = round(
+                float(product.price),
+                2
+            )
+
+            base_catalogue_total += (
+                current_unit_price
                 * item.quantity
             )
 
-        # -----------------------------
-        # Catalogue check
-        # -----------------------------
+            if quote:
+                quoted_item = quote_items_by_id.get(
+                    int(item.product_id)
+                )
+
+                if not quoted_item:
+                    price_lock_passed = False
+                else:
+                    quoted_unit_price = round(
+                        float(
+                            quoted_item.get(
+                                "unit_price",
+                                -1
+                            )
+                        ),
+                        2
+                    )
+
+                    if (
+                        current_unit_price
+                        != quoted_unit_price
+                    ):
+                        price_lock_passed = False
+
+        if not quote:
+            server_total = round(
+                base_catalogue_total,
+                2
+            )
 
         checks.append({
             "name": "Catalogue Check",
             "passed": catalogue_passed,
-            "message":
+            "message": (
                 "All products exist in the merchant catalogue"
                 if catalogue_passed
                 else "One or more products no longer exist"
+            ),
         })
-
-        # -----------------------------
-        # Quantity check
-        # -----------------------------
 
         checks.append({
             "name": "Quantity Check",
             "passed": quantity_passed,
-            "message":
+            "message": (
                 "All quantities are valid"
                 if quantity_passed
                 else "One or more quantities are invalid"
+            ),
         })
-
-        # -----------------------------
-        # Stock check
-        # -----------------------------
 
         checks.append({
             "name": "Stock Check",
             "passed": stock_passed,
-            "message":
+            "message": (
                 "Requested quantities are available"
                 if stock_passed
                 else "Requested quantity exceeds available stock"
+            ),
         })
 
-        # -----------------------------
-        # Budget check
-        # -----------------------------
+        if quote:
+            checks.append({
+                "name": "Price Lock Check",
+                "passed": price_lock_passed,
+                "message": (
+                    "Current catalogue prices match the quoted prices"
+                    if price_lock_passed
+                    else "Product pricing changed after the quote was created"
+                ),
+            })
 
         budget_passed = True
 
-        if request.max_budget is not None:
+        if authoritative_budget is not None:
             budget_passed = (
                 server_total
-                <= request.max_budget
+                <= authoritative_budget
             )
 
             checks.append({
                 "name": "Budget Check",
                 "passed": budget_passed,
-                "message":
+                "message": (
                     (
-                        f"Cart total ₹{server_total:,.0f} "
-                        f"is within budget ₹{request.max_budget:,.0f}"
+                        f"Final payable ₹{server_total:,.2f} "
+                        f"is within budget ₹{authoritative_budget:,.2f}"
                     )
                     if budget_passed
                     else
                     (
-                        f"Cart total ₹{server_total:,.0f} "
-                        f"exceeds budget ₹{request.max_budget:,.0f}"
+                        f"Final payable ₹{server_total:,.2f} "
+                        f"exceeds budget ₹{authoritative_budget:,.2f}"
                     )
+                ),
             })
         else:
             checks.append({
                 "name": "Budget Check",
                 "passed": True,
-                "message": "No maximum budget was specified"
+                "message": "No maximum budget was specified",
             })
-
-        # -----------------------------
-        # Final decision
-        # -----------------------------
 
         passed = (
             catalogue_passed
             and quantity_passed
             and stock_passed
             and budget_passed
+            and quote_passed
+            and price_lock_passed
         )
 
         decision = (
@@ -500,10 +1058,6 @@ def check_policy(request: PolicyRequest):
             if passed
             else "BLOCKED"
         )
-
-        # -----------------------------
-        # Audit Trail
-        # -----------------------------
 
         create_audit_log(
             event_type=(
@@ -514,9 +1068,9 @@ def check_policy(request: PolicyRequest):
             status=decision,
             reference_id=policy_reference_id,
             message=(
-                "Policy engine approved the cart."
+                "Policy engine approved the checkout."
                 if passed
-                else "Policy engine blocked the cart."
+                else "Policy engine blocked the checkout."
             ),
             details={
                 "items": [
@@ -526,11 +1080,21 @@ def check_policy(request: PolicyRequest):
                     }
                     for item in request.items
                 ],
-                "server_total": round(server_total, 2),
-                "max_budget": request.max_budget,
+                "quote_id": (
+                    quote.quote_id
+                    if quote
+                    else None
+                ),
+                "server_total": round(
+                    server_total,
+                    2
+                ),
+                "max_budget": authoritative_budget,
                 "catalogue_passed": catalogue_passed,
                 "quantity_passed": quantity_passed,
                 "stock_passed": stock_passed,
+                "price_lock_passed": price_lock_passed,
+                "quote_passed": quote_passed,
                 "budget_passed": budget_passed,
             },
         )
@@ -539,14 +1103,64 @@ def check_policy(request: PolicyRequest):
             "passed": passed,
             "decision": decision,
             "reference_id": policy_reference_id,
+            "quote_id": (
+                quote.quote_id
+                if quote
+                else None
+            ),
             "server_total": round(
                 server_total,
                 2
             ),
-            "max_budget":
-                request.max_budget,
-            "checks": checks
+            "max_budget": authoritative_budget,
+            "pricing": (
+                {
+                    "subtotal": round(
+                        float(
+                            quote.subtotal_rupees
+                        ),
+                        2
+                    ),
+                    "discount": round(
+                        float(
+                            quote.discount_rupees
+                        ),
+                        2
+                    ),
+                    "tax": round(
+                        float(
+                            quote.tax_rupees
+                        ),
+                        2
+                    ),
+                    "shipping": round(
+                        float(
+                            quote.shipping_rupees
+                        ),
+                        2
+                    ),
+                    "social_contribution": round(
+                        float(
+                            quote.social_contribution_rupees
+                        ),
+                        2
+                    ),
+                    "grand_total": round(
+                        float(
+                            quote.grand_total_rupees
+                        ),
+                        2
+                    ),
+                }
+                if quote
+                else None
+            ),
+            "checks": checks,
         }
+
+    except HTTPException:
+        db.rollback()
+        raise
 
     finally:
         db.close()
@@ -562,10 +1176,6 @@ def approve_payment(request: PaymentApprovalRequest):
     )
 
     try:
-        # -----------------------------
-        # Empty cart
-        # -----------------------------
-
         if not request.items:
             create_audit_log(
                 event_type="APPROVAL_BLOCKED",
@@ -578,6 +1188,7 @@ def approve_payment(request: PaymentApprovalRequest):
                 details={
                     "reason": "EMPTY_CART",
                     "max_budget": request.max_budget,
+                    "quote_id": request.quote_id,
                 },
             )
 
@@ -586,12 +1197,64 @@ def approve_payment(request: PaymentApprovalRequest):
                 detail="Cart is empty"
             )
 
-        validated_items = []
-        server_total = 0.0
+        quote = _load_checkout_quote(
+            db,
+            request.quote_id
+        )
 
-        # -----------------------------
-        # Validate items
-        # -----------------------------
+        authoritative_budget = request.max_budget
+
+        if quote:
+            now = _utc_now_naive()
+
+            if now > quote.expires_at:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "Checkout quote expired. "
+                        "Create a fresh quote."
+                    )
+                )
+
+            if quote.status != "QUOTED":
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "Checkout quote is no longer "
+                        "available for approval"
+                    )
+                )
+
+            if quote.approval_id:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "Checkout quote has already "
+                        "been approved"
+                    )
+                )
+
+            if (
+                _request_item_signature(request.items)
+                != _quote_item_signature(quote.items)
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "Cart changed after the quote "
+                        "was created"
+                    )
+                )
+
+            authoritative_budget = quote.max_budget
+
+        validated_items = []
+        raw_catalogue_total = 0.0
+
+        quote_items_by_id = {
+            int(item.get("product_id")): item
+            for item in (quote.items or [])
+        } if quote else {}
 
         for item in request.items:
             product = (
@@ -615,6 +1278,7 @@ def approve_payment(request: PaymentApprovalRequest):
                     details={
                         "reason": "PRODUCT_NOT_FOUND",
                         "product_id": item.product_id,
+                        "quote_id": request.quote_id,
                     },
                 )
 
@@ -624,45 +1288,12 @@ def approve_payment(request: PaymentApprovalRequest):
                 )
 
             if item.quantity <= 0:
-                create_audit_log(
-                    event_type="APPROVAL_BLOCKED",
-                    status="BLOCKED",
-                    reference_id=approval_attempt_id,
-                    message=(
-                        "Purchase approval blocked "
-                        "because quantity was invalid."
-                    ),
-                    details={
-                        "reason": "INVALID_QUANTITY",
-                        "product_id": product.id,
-                        "quantity": item.quantity,
-                    },
-                )
-
                 raise HTTPException(
                     status_code=400,
                     detail="Invalid quantity"
                 )
 
             if item.quantity > product.stock:
-                create_audit_log(
-                    event_type="APPROVAL_BLOCKED",
-                    status="BLOCKED",
-                    reference_id=approval_attempt_id,
-                    message=(
-                        "Purchase approval blocked "
-                        "because stock was insufficient."
-                    ),
-                    details={
-                        "reason": "INSUFFICIENT_STOCK",
-                        "product_id": product.id,
-                        "requested_quantity":
-                            item.quantity,
-                        "available_stock":
-                            product.stock,
-                    },
-                )
-
                 raise HTTPException(
                     status_code=400,
                     detail=(
@@ -671,29 +1302,77 @@ def approve_payment(request: PaymentApprovalRequest):
                     )
                 )
 
-            item_total = (
-                float(product.price)
+            current_unit_price = round(
+                float(product.price),
+                2
+            )
+
+            if quote:
+                quoted_item = quote_items_by_id.get(
+                    int(product.id)
+                )
+
+                if not quoted_item:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            "Checkout quote does not "
+                            "match the cart"
+                        )
+                    )
+
+                quoted_unit_price = round(
+                    float(
+                        quoted_item.get(
+                            "unit_price",
+                            -1
+                        )
+                    ),
+                    2
+                )
+
+                if (
+                    current_unit_price
+                    != quoted_unit_price
+                ):
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            "Product pricing changed. "
+                            "Create a fresh quote."
+                        )
+                    )
+
+            raw_catalogue_total += (
+                current_unit_price
                 * item.quantity
             )
 
-            server_total += item_total
-
             validated_items.append({
                 "product_id": product.id,
-                "product_name":
-                    product.productName,
+                "product_name": product.productName,
                 "quantity": item.quantity,
-                "unit_price":
-                    float(product.price),
+                "unit_price": current_unit_price,
             })
 
-        # -----------------------------
-        # Budget validation
-        # -----------------------------
+        server_total = (
+            round(
+                float(
+                    quote.grand_total_rupees
+                ),
+                2
+            )
+            if quote
+            else round(
+                raw_catalogue_total,
+                2
+            )
+        )
 
         if (
-            request.max_budget is not None
-            and server_total > request.max_budget
+            authoritative_budget is not None
+            and server_total
+            > authoritative_budget
         ):
             create_audit_log(
                 event_type="APPROVAL_BLOCKED",
@@ -701,36 +1380,35 @@ def approve_payment(request: PaymentApprovalRequest):
                 reference_id=approval_attempt_id,
                 message=(
                     "Purchase approval blocked "
-                    "because the cart exceeded "
-                    "the budget."
+                    "because the final payable "
+                    "exceeded the budget."
                 ),
                 details={
                     "reason": "BUDGET_EXCEEDED",
-                    "server_total":
-                        round(server_total, 2),
-                    "max_budget":
-                        request.max_budget,
+                    "server_total": server_total,
+                    "max_budget": authoritative_budget,
+                    "quote_id": (
+                        quote.quote_id
+                        if quote
+                        else None
+                    ),
                 },
             )
 
             raise HTTPException(
                 status_code=400,
-                detail="Cart exceeds approved budget"
+                detail=(
+                    "Final payable exceeds "
+                    "approved budget"
+                )
             )
-
-        # -----------------------------
-        # Create persistent approval
-        # -----------------------------
 
         approval_id = (
             "approval_"
             + uuid.uuid4().hex
         )
 
-        created_at = (
-            datetime.now(timezone.utc)
-            .replace(tzinfo=None)
-        )
+        created_at = _utc_now_naive()
 
         expires_at = (
             created_at
@@ -741,11 +1419,8 @@ def approve_payment(request: PaymentApprovalRequest):
             models.PurchaseApproval(
                 approval_id=approval_id,
                 items=validated_items,
-                amount_rupees=round(
-                    server_total,
-                    2
-                ),
-                max_budget=request.max_budget,
+                amount_rupees=server_total,
+                max_budget=authoritative_budget,
                 used=False,
                 created_at=created_at,
                 expires_at=expires_at,
@@ -753,17 +1428,13 @@ def approve_payment(request: PaymentApprovalRequest):
         )
 
         db.add(persistent_approval)
+
+        if quote:
+            quote.approval_id = approval_id
+            quote.status = "APPROVED"
+
         db.commit()
         db.refresh(persistent_approval)
-
-        # -----------------------------
-        # Temporary memory cache
-        # -----------------------------
-        # Kept only while create-order
-        # is migrated to database storage.
-        # -----------------------------
-        # Audit successful approval
-        # -----------------------------
 
         create_audit_log(
             event_type="USER_APPROVED",
@@ -772,10 +1443,13 @@ def approve_payment(request: PaymentApprovalRequest):
             message="User approved the purchase.",
             details={
                 "items": validated_items,
-                "amount":
-                    round(server_total, 2),
-                "max_budget":
-                    request.max_budget,
+                "amount": server_total,
+                "max_budget": authoritative_budget,
+                "quote_id": (
+                    quote.quote_id
+                    if quote
+                    else None
+                ),
                 "expires_in_seconds": 600,
                 "persistent": True,
             },
@@ -784,14 +1458,21 @@ def approve_payment(request: PaymentApprovalRequest):
         return {
             "approved": True,
             "approval_id": approval_id,
-            "amount": round(
-                server_total,
-                2
+            "quote_id": (
+                quote.quote_id
+                if quote
+                else None
             ),
+            "amount": server_total,
             "expires_in_seconds": 600,
-            "message":
+            "message": (
                 "Purchase approval recorded"
+            ),
         }
+
+    except HTTPException:
+        db.rollback()
+        raise
 
     except Exception:
         db.rollback()
@@ -799,6 +1480,8 @@ def approve_payment(request: PaymentApprovalRequest):
 
     finally:
         db.close()
+
+
 @app.post("/payment/create-order")
 def create_payment_order(request: PaymentOrderRequest):
     key_id = os.getenv("RAZORPAY_KEY_ID")
@@ -932,9 +1615,23 @@ def create_payment_order(request: PaymentOrderRequest):
                 detail="Purchase approval has expired"
             )
 
-        current_total = 0.0
-
         approval_items = approval.items or []
+
+        quote = (
+            db.query(models.CheckoutQuote)
+            .filter(
+                models.CheckoutQuote.approval_id
+                == request.approval_id
+            )
+            .first()
+        )
+
+        quote_items_by_id = {
+            int(item.get("product_id")): item
+            for item in (quote.items or [])
+        } if quote else {}
+
+        raw_catalogue_total = 0.0
 
         # -----------------------------
         # Revalidate catalogue
@@ -998,54 +1695,148 @@ def create_payment_order(request: PaymentOrderRequest):
                     )
                 )
 
-            current_total += (
-                float(product.price)
+            current_unit_price = round(
+                float(product.price),
+                2
+            )
+
+            raw_catalogue_total += (
+                current_unit_price
                 * item["quantity"]
             )
 
-        # -----------------------------
-        # Price revalidation
-        # -----------------------------
+            if quote:
+                quoted_item = quote_items_by_id.get(
+                    int(product.id)
+                )
 
-        approved_amount = float(
-            approval.amount_rupees
+                if not quoted_item:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            "Approved quote does not "
+                            "match the cart"
+                        )
+                    )
+
+                quoted_unit_price = round(
+                    float(
+                        quoted_item.get(
+                            "unit_price",
+                            -1
+                        )
+                    ),
+                    2
+                )
+
+                if (
+                    quoted_unit_price
+                    != current_unit_price
+                ):
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            "Product pricing changed. "
+                            "Approval must be repeated."
+                        )
+                    )
+
+        approved_amount = round(
+            float(
+                approval.amount_rupees
+            ),
+            2
         )
 
-        if round(current_total, 2) != round(
-            approved_amount,
-            2
-        ):
-            create_audit_log(
-                event_type="PAYMENT_ORDER_BLOCKED",
-                status="BLOCKED",
-                reference_id=request.approval_id,
-                message=(
-                    "Payment order blocked because "
-                    "product pricing changed."
-                ),
-                details={
-                    "reason": "PRICE_CHANGED",
-                    "approved_amount":
-                        approved_amount,
-                    "current_amount":
-                        round(current_total, 2),
-                },
-            )
-
-            raise HTTPException(
-                status_code=409,
-                detail=(
-                    "Product pricing changed. "
-                    "Approval must be repeated."
+        if quote:
+            if quote.status != "APPROVED":
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "Checkout quote is not "
+                        "approved for payment"
+                    )
                 )
+
+            quoted_amount = round(
+                float(
+                    quote.grand_total_rupees
+                ),
+                2
             )
 
-        # -----------------------------
-        # Create Razorpay Test order
-        # -----------------------------
+            if approved_amount != quoted_amount:
+                create_audit_log(
+                    event_type="PAYMENT_ORDER_BLOCKED",
+                    status="BLOCKED",
+                    reference_id=request.approval_id,
+                    message=(
+                        "Payment order blocked because "
+                        "the approved amount did not "
+                        "match the checkout quote."
+                    ),
+                    details={
+                        "reason": "QUOTE_AMOUNT_MISMATCH",
+                        "approved_amount":
+                            approved_amount,
+                        "quoted_amount":
+                            quoted_amount,
+                        "quote_id":
+                            quote.quote_id,
+                    },
+                )
+
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "Approved amount does not "
+                        "match checkout quote"
+                    )
+                )
+
+            amount_for_payment = quoted_amount
+
+        else:
+            current_total = round(
+                raw_catalogue_total,
+                2
+            )
+
+            if current_total != approved_amount:
+                create_audit_log(
+                    event_type="PAYMENT_ORDER_BLOCKED",
+                    status="BLOCKED",
+                    reference_id=request.approval_id,
+                    message=(
+                        "Payment order blocked because "
+                        "product pricing changed."
+                    ),
+                    details={
+                        "reason": "PRICE_CHANGED",
+                        "approved_amount":
+                            approved_amount,
+                        "current_amount":
+                            current_total,
+                    },
+                )
+
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "Product pricing changed. "
+                        "Approval must be repeated."
+                    )
+                )
+
+            amount_for_payment = current_total
 
         amount_in_paise = int(
-            round(current_total * 100)
+            Decimal(str(amount_for_payment))
+            .quantize(
+                Decimal("0.01"),
+                rounding=ROUND_HALF_UP
+            )
+            * 100
         )
 
         client = razorpay.Client(
@@ -1063,7 +1854,12 @@ def create_payment_order(request: PaymentOrderRequest):
             "receipt": receipt,
             "notes": {
                 "source": "agentpass-commerce",
-                "mode": "buildathon-test"
+                "mode": "buildathon-test",
+                "quote_id": (
+                    quote.quote_id
+                    if quote
+                    else "legacy"
+                ),
             }
         })
 

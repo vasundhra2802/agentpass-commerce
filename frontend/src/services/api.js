@@ -1,4 +1,4 @@
-const API_BASE_URL = "http://127.0.0.1:8000";
+const API_BASE_URL = "http://127.0.0.1:8001";
 
 export async function getProducts() {
   const response = await fetch(`${API_BASE_URL}/products`);
@@ -87,7 +87,11 @@ export async function updateProduct(productId, product) {
 
   return data;
 }
-export async function checkPolicy(items, maxBudget) {
+export async function checkPolicy(
+  items,
+  maxBudget,
+  quoteId = null
+) {
   const response = await fetch(
     `${API_BASE_URL}/policy/check`,
     {
@@ -101,6 +105,7 @@ export async function checkPolicy(items, maxBudget) {
           quantity: item.quantity,
         })),
         max_budget: maxBudget,
+        quote_id: quoteId,
       }),
     }
   );
@@ -117,7 +122,8 @@ export async function checkPolicy(items, maxBudget) {
 }
 export async function approvePurchase(
   items,
-  maxBudget
+  maxBudget,
+  quoteId = null
 ) {
   const response = await fetch(
     `${API_BASE_URL}/payment/approve`,
@@ -132,6 +138,7 @@ export async function approvePurchase(
           quantity: item.quantity,
         })),
         max_budget: maxBudget,
+        quote_id: quoteId,
       }),
     }
   );
@@ -204,7 +211,7 @@ export async function verifyPayment(
 }
 export async function getPaymentTransactions() {
   const response = await fetch(
-    "http://127.0.0.1:8000/payment-transactions"
+    "${API_BASE_URL}/payment-transactions"
   );
 
   if (!response.ok) {
@@ -217,7 +224,7 @@ export async function getPaymentTransactions() {
 }
 export async function getAuditLogs() {
   const response = await fetch(
-    "http://127.0.0.1:8000/audit-logs"
+    "${API_BASE_URL}/audit-logs"
   );
 
   if (!response.ok) {
@@ -228,7 +235,7 @@ export async function getAuditLogs() {
 }
 export async function getGrowthSuggestions(items, maxBudget) {
   const response = await fetch(
-    "http://127.0.0.1:8000/growth/suggestions",
+    "${API_BASE_URL}/growth/suggestions",
     {
       method: "POST",
       headers: {
@@ -275,6 +282,48 @@ export async function recordPaymentFailure({
     throw new Error(
       data.detail ||
         "Could not record payment status"
+    );
+  }
+
+  return data;
+}
+export async function createCheckoutQuote(
+  items,
+  maxBudget,
+  socialContribution = 0,
+  socialCause = null,
+  deliveryZone = "LOCAL"
+) {
+  const response = await fetch(
+    `${API_BASE_URL}/checkout/quote`,
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        items: items.map((item) => ({
+          product_id: item.id,
+          quantity: item.quantity,
+        })),
+        max_budget: maxBudget,
+        social_contribution_rupees:
+          Number(socialContribution) || 0,
+        social_cause:
+          Number(socialContribution) > 0
+            ? socialCause
+            : null,
+        delivery_zone: deliveryZone,
+      }),
+    }
+  );
+
+  const data = await response.json();
+
+  if (!response.ok) {
+    throw new Error(
+      data.detail ||
+        "Could not create checkout quote"
     );
   }
 
