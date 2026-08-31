@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import {
   BrainCircuit,
@@ -15,6 +15,7 @@ import {
 
 import {
   getRecommendations,
+  getProducts
 } from "../services/api";
 
 import { useCart } from "../context/CartContext";
@@ -33,12 +34,111 @@ function AIAssistant() {
     addToCart,
     cartItemCount,
   } = useCart();
+ const [exampleQueries, setExampleQueries] = useState([
+  "I need something elegant to tell time at work under ₹6,000",
+  "I need a lightweight bag for short trips under ₹2,500",
+  "I need a compact charging accessory under ₹500",
+]);
 
-  const exampleQueries = [
-    "Something comfortable for morning runs under 4000",
-    "A device for writing programs under 70000",
-    "Something elegant to wear on my wrist for office under 7000",
-  ];
+useEffect(() => {
+  const loadExampleQueries = async () => {
+    try {
+      const products = await getProducts();
+
+      const uniqueAvailableProducts = products
+        .filter(
+          (product) =>
+            Number(product.stock) > 0 &&
+            Number(product.price) > 0
+        )
+        .filter(
+          (product, index, array) =>
+            array.findIndex(
+              (item) =>
+                item.productName
+                  ?.trim()
+                  .toLowerCase() ===
+                product.productName
+                  ?.trim()
+                  .toLowerCase()
+            ) === index
+        )
+        .slice(0, 3);
+
+     const buildSemanticQuery = (product) => {
+  const searchableText = `
+    ${product.productName || ""}
+    ${product.category || ""}
+    ${product.description || ""}
+  `.toLowerCase();
+
+  const budget =
+    Math.ceil(Number(product.price) / 500) * 500;
+
+  const formattedBudget =
+    budget.toLocaleString("en-IN");
+
+  if (
+    searchableText.includes("watch") ||
+    searchableText.includes("wrist") ||
+    searchableText.includes("time")
+  ) {
+    return `I need something elegant to tell time at work under ₹${formattedBudget}`;
+  }
+   }
+
+  if (
+    searchableText.includes("cable") ||
+    searchableText.includes("charger") ||
+    searchableText.includes("charging") ||
+    searchableText.includes("power")
+  ) {
+    return `I need a compact charging accessory under ₹${formattedBudget}`;
+  }
+
+  if (
+    searchableText.includes("backpack") ||
+    searchableText.includes("bag") ||
+    searchableText.includes("travel") ||
+    searchableText.includes("pack")
+  ) {
+    return `I need a lightweight bag for short trips under ₹${formattedBudget}`;
+ 
+
+  if (
+    searchableText.includes("band") ||
+    searchableText.includes("bracelet")
+  ) {
+    return `I want a simple everyday wrist accessory under ₹${formattedBudget}`;
+  }
+
+  if (
+    searchableText.includes("pouch") ||
+    searchableText.includes("organizer")
+  ) {
+    return `I need a compact organizer for travel under ₹${formattedBudget}`;
+  }
+
+  return `Show me something useful for everyday use under ₹${formattedBudget}`;
+};
+
+const queries = uniqueAvailableProducts.map(
+  buildSemanticQuery
+);
+
+      setExampleQueries(queries);
+    } catch (error) {
+      console.error(
+        "Could not load catalogue-aware examples:",
+        error
+      );
+
+     
+    }
+  };
+
+  loadExampleQueries();
+}, []);
 
   const handleSearch = async () => {
     if (!query.trim()) {
