@@ -15,7 +15,7 @@ import {
 
 import {
   getRecommendations,
-  getProducts
+  getProducts,
 } from "../services/api";
 
 import { useCart } from "../context/CartContext";
@@ -34,115 +34,152 @@ function AIAssistant() {
     addToCart,
     cartItemCount,
   } = useCart();
- const [exampleQueries, setExampleQueries] = useState([
-  "I need something elegant to tell time at work under ₹6,000",
-  "I need a lightweight bag for short trips under ₹2,500",
-  "I need a compact charging accessory under ₹500",
-]);
 
-useEffect(() => {
-  const loadExampleQueries = async () => {
-    try {
-      const products = await getProducts();
+  const fallbackQueries = [
+    "I need something elegant to tell time at work under ₹6,000",
+    "I need a lightweight bag for short trips under ₹2,500",
+    "I need a compact charging accessory under ₹500",
+  ];
 
-      const uniqueAvailableProducts = products
-        .filter(
-          (product) =>
-            Number(product.stock) > 0 &&
-            Number(product.price) > 0
-        )
-        .filter(
-          (product, index, array) =>
-            array.findIndex(
-              (item) =>
-                item.productName
-                  ?.trim()
-                  .toLowerCase() ===
-                product.productName
-                  ?.trim()
-                  .toLowerCase()
-            ) === index
-        )
-        .slice(0, 3);
+  const [exampleQueries, setExampleQueries] =
+    useState(fallbackQueries);
 
-     const buildSemanticQuery = (product) => {
-  const searchableText = `
-    ${product.productName || ""}
-    ${product.category || ""}
-    ${product.description || ""}
-  `.toLowerCase();
+  useEffect(() => {
+    const loadExampleQueries = async () => {
+      try {
+        const products = await getProducts();
 
-  const budget =
-    Math.ceil(Number(product.price) / 500) * 500;
+        const uniqueAvailableProducts = products
+          .filter(
+            (product) =>
+              Number(product.stock) > 0 &&
+              Number(product.price) > 0
+          )
+          .filter(
+            (product, index, array) =>
+              array.findIndex(
+                (item) =>
+                  item.productName
+                    ?.trim()
+                    .toLowerCase() ===
+                  product.productName
+                    ?.trim()
+                    .toLowerCase()
+              ) === index
+          );
 
-  const formattedBudget =
-    budget.toLocaleString("en-IN");
+        const buildSemanticQuery = (product) => {
+          const searchableText = `
+            ${product.productName || ""}
+            ${product.category || ""}
+            ${product.subcategory || ""}
+            ${product.description || ""}
+          `.toLowerCase();
 
-  if (
-    searchableText.includes("watch") ||
-    searchableText.includes("wrist") ||
-    searchableText.includes("time")
-  ) {
-    return `I need something elegant to tell time at work under ₹${formattedBudget}`;
-  }
-   }
+          const budget =
+            Math.ceil(
+              Number(product.price) / 500
+            ) * 500;
 
-  if (
-    searchableText.includes("cable") ||
-    searchableText.includes("charger") ||
-    searchableText.includes("charging") ||
-    searchableText.includes("power")
-  ) {
-    return `I need a compact charging accessory under ₹${formattedBudget}`;
-  }
+          const formattedBudget =
+            budget.toLocaleString("en-IN");
 
-  if (
-    searchableText.includes("backpack") ||
-    searchableText.includes("bag") ||
-    searchableText.includes("travel") ||
-    searchableText.includes("pack")
-  ) {
-    return `I need a lightweight bag for short trips under ₹${formattedBudget}`;
- 
+          if (
+            searchableText.includes("cable") ||
+            searchableText.includes("charger") ||
+            searchableText.includes("charging") ||
+            searchableText.includes("power")
+          ) {
+            return `I need a compact charging accessory under ₹${formattedBudget}`;
+          }
 
-  if (
-    searchableText.includes("band") ||
-    searchableText.includes("bracelet")
-  ) {
-    return `I want a simple everyday wrist accessory under ₹${formattedBudget}`;
-  }
+          if (
+            searchableText.includes("backpack") ||
+            searchableText.includes("bag")
+          ) {
+            return `I need a lightweight bag for short trips under ₹${formattedBudget}`;
+          }
 
-  if (
-    searchableText.includes("pouch") ||
-    searchableText.includes("organizer")
-  ) {
-    return `I need a compact organizer for travel under ₹${formattedBudget}`;
-  }
+          if (
+            searchableText.includes("pouch") ||
+            searchableText.includes("organizer")
+          ) {
+            return `I need a compact organizer for travel under ₹${formattedBudget}`;
+          }
 
-  return `Show me something useful for everyday use under ₹${formattedBudget}`;
-};
+          if (
+            searchableText.includes("band") ||
+            searchableText.includes("bracelet")
+          ) {
+            return `I want a simple everyday wrist accessory under ₹${formattedBudget}`;
+          }
 
-const queries = uniqueAvailableProducts.map(
-  buildSemanticQuery
-);
+          if (
+            searchableText.includes("watch") ||
+            searchableText.includes("time")
+          ) {
+            return `I need something elegant to tell time at work under ₹${formattedBudget}`;
+          }
 
-      setExampleQueries(queries);
-    } catch (error) {
-      console.error(
-        "Could not load catalogue-aware examples:",
-        error
-      );
+          if (
+            searchableText.includes("travel") ||
+            searchableText.includes("pack")
+          ) {
+            return `I need something useful for short trips under ₹${formattedBudget}`;
+          }
 
-     
-    }
+          return `Show me something useful for everyday use under ₹${formattedBudget}`;
+        };
+
+        const catalogueQueries = Array.from(
+          new Set(
+            uniqueAvailableProducts.map(
+              buildSemanticQuery
+            )
+          )
+        ).slice(0, 3);
+
+        if (catalogueQueries.length > 0) {
+          const combinedQueries = Array.from(
+            new Set([
+              ...catalogueQueries,
+              ...fallbackQueries,
+            ])
+          ).slice(0, 3);
+
+          setExampleQueries(combinedQueries);
+        }
+      } catch (error) {
+        console.error(
+          "Could not load catalogue-aware examples:",
+          error
+        );
+      }
+    };
+
+    loadExampleQueries();
+  }, []);
+
+  const isBroadQuery = (text) => {
+    const cleaned = text
+      .toLowerCase()
+      .replace(/[₹,]/g, "")
+      .replace(/\d+/g, "")
+      .replace(
+        /\b(something|anything|product|products|item|items|thing|things|under|below|within|upto|up|to|rs|rupees|show|me|need|want)\b/g,
+        ""
+      )
+      .replace(/\s+/g, " ")
+      .trim();
+
+    return cleaned.length < 3;
   };
-
-  loadExampleQueries();
-}, []);
 
   const handleSearch = async () => {
     if (!query.trim()) {
-      setMessage("Please describe what you are looking for.");
+      setMessage(
+        "Please describe what you are looking for."
+      );
       return;
     }
 
@@ -152,11 +189,41 @@ const queries = uniqueAvailableProducts.map(
       setRecommendations([]);
       setDetectedBudget(null);
 
-      const data = await getRecommendations(query.trim());
-      const results = data.recommendations || [];
+      const data = await getRecommendations(
+        query.trim()
+      );
+
+      const results =
+        data.recommendations || [];
+
+      const budget =
+        data.max_budget ?? null;
+
+      setDetectedBudget(budget);
+
+      if (isBroadQuery(query)) {
+        setRecommendations([]);
+
+        if (budget !== null) {
+          const budgetText = Number(
+            budget
+          ).toLocaleString("en-IN");
+
+          setMessage(
+            results.length > 0
+              ? `I found ${results.length} available products within your ₹${budgetText} budget, but your request is broad. What kind of product are you looking for?`
+              : `I understood your ₹${budgetText} budget, but I need a little more detail. What kind of product are you looking for?`
+          );
+        } else {
+          setMessage(
+            "Your request is broad. Tell me a little more about what kind of product you are looking for."
+          );
+        }
+
+        return;
+      }
 
       setRecommendations(results);
-      setDetectedBudget(data.max_budget ?? null);
 
       if (data.message) {
         setMessage(data.message);
