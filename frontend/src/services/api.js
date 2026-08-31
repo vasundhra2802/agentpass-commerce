@@ -224,14 +224,21 @@ export async function getPaymentTransactions() {
 }
 export async function getAuditLogs() {
   const response = await fetch(
-    "${API_BASE_URL}/audit-logs"
+    `${API_BASE_URL}/audit-logs`,
+    {
+      cache: "no-store",
+    }
   );
 
+  const data = await response.json();
+
   if (!response.ok) {
-    throw new Error("Failed to load audit logs");
+    throw new Error(
+      data.detail || "Failed to load audit logs"
+    );
   }
 
-  return await response.json();
+  return data;
 }
 export async function getGrowthSuggestions(items, maxBudget) {
   const response = await fetch(

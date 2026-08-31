@@ -51,6 +51,48 @@ export default function AuditLogs() {
     return String(value || "")
       .replaceAll("_", " ");
   }
+  function getAuditReason(log) {
+  const details = log.details || {};
+
+  if (log.event_type === "POLICY_BLOCKED") {
+    if (details.budget_passed === false) {
+      return `Final payable ₹${Number(
+        details.server_total
+      ).toFixed(2)} exceeds budget ₹${Number(
+        details.max_budget
+      ).toFixed(2)}`;
+    }
+
+    if (details.stock_passed === false) {
+      return "Requested quantity is not available in stock";
+    }
+
+    if (details.price_locked === false) {
+      return "Catalogue price changed after the checkout quote";
+    }
+  }
+
+  if (log.event_type === "CHECKOUT_QUOTED") {
+    return `Final payable ₹${Number(
+      details.grand_total || 0
+    ).toFixed(2)}`;
+  }
+
+  if (log.event_type === "PAYMENT_VERIFIED") {
+    return "Razorpay Test payment was authenticated and captured";
+  }
+
+  if (log.event_type === "ORDER_FULFILLED") {
+    return "Verified payment completed and inventory was updated";
+  }
+
+  if (log.event_type === "USER_APPROVED") {
+    return "User explicitly approved the validated purchase";
+  }
+
+  return log.message || "Recorded commerce decision";
+  
+}
 
   if (loading) {
     return (
@@ -108,6 +150,10 @@ export default function AuditLogs() {
                 <th className="text-left px-5 py-3 text-sm font-medium">
                   Message
                 </th>
+                <th className="text-left px-5 py-3 text-sm font-medium">
+  Reason / Details
+</th>
+                
 
                 <th className="text-left px-5 py-3 text-sm font-medium">
                   Time
@@ -136,6 +182,9 @@ export default function AuditLogs() {
                   <td className="px-5 py-4 text-sm">
                     {log.message}
                   </td>
+                  <td className="px-5 py-4 text-sm">
+  {getAuditReason(log)}
+</td>
 
                   <td className="px-5 py-4 text-sm">
                     {formatUtcToIst(log.created_at)}
