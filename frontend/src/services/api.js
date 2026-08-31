@@ -211,16 +211,22 @@ export async function verifyPayment(
 }
 export async function getPaymentTransactions() {
   const response = await fetch(
-    "${API_BASE_URL}/payment-transactions"
+    `${API_BASE_URL}/payment-transactions`,
+    {
+      cache: "no-store",
+    }
   );
+
+  const data = await response.json();
 
   if (!response.ok) {
     throw new Error(
-      "Failed to load payment transactions"
+      data.detail ||
+        "Failed to load payment transactions"
     );
   }
 
-  return await response.json();
+  return data;
 }
 export async function getAuditLogs() {
   const response = await fetch(

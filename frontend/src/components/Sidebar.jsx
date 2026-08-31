@@ -78,6 +78,7 @@ function Sidebar() {
             <NavLink
               key={item.to}
               to={item.to}
+              end
               className={linkClass}
             >
               <Icon size={19} strokeWidth={2} />
