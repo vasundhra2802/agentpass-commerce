@@ -185,6 +185,10 @@ def get_payment_transactions():
 
     finally:
         db.close()
+class PaymentFailureRequest(BaseModel):
+    payment_session_id: str
+    status: str
+    reason: str | None = None
 
 @app.get("/")
 def home():
@@ -1177,6 +1181,116 @@ def create_payment_order(request: PaymentOrderRequest):
                 "could not be created"
             )
         )
+
+    except HTTPException:
+        db.rollback()
+        raise
+
+    except Exception:
+        db.rollback()
+        raise
+
+    finally:
+        db.close()
+@app.post("/payment/failure")
+def record_payment_failure(request: PaymentFailureRequest):
+    allowed_statuses = {
+        "FAILED",
+        "CANCELLED",
+    }
+
+    normalized_status = (
+        request.status
+        .strip()
+        .upper()
+    )
+
+    if normalized_status not in allowed_statuses:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid payment failure status"
+        )
+
+    db = SessionLocal()
+
+    try:
+        payment_session = (
+            db.query(models.PaymentSession)
+            .filter(
+                models.PaymentSession.payment_session_id
+                == request.payment_session_id
+            )
+            .first()
+        )
+
+        transaction = (
+            db.query(models.PaymentTransaction)
+            .filter(
+                models.PaymentTransaction.payment_session_id
+                == request.payment_session_id
+            )
+            .first()
+        )
+
+        if not payment_session or not transaction:
+            raise HTTPException(
+                status_code=404,
+                detail="Payment session not found"
+            )
+
+        # Never overwrite a completed payment.
+        if transaction.fulfilled:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "A fulfilled transaction cannot "
+                    "be marked as failed or cancelled"
+                )
+            )
+
+        safe_reason = (
+            request.reason.strip()[:200]
+            if request.reason
+            else None
+        )
+
+        payment_session.status = normalized_status
+
+        transaction.status = normalized_status
+        transaction.failure_reason = safe_reason
+
+        db.commit()
+
+        event_type = (
+            "PAYMENT_FAILED"
+            if normalized_status == "FAILED"
+            else "PAYMENT_CANCELLED"
+        )
+
+        create_audit_log(
+            event_type=event_type,
+            status=normalized_status,
+            reference_id=request.payment_session_id,
+            message=(
+                "Razorpay Test payment failed."
+                if normalized_status == "FAILED"
+                else
+                "Razorpay Test payment was cancelled."
+            ),
+            details={
+                "reason": safe_reason,
+            },
+        )
+
+        return {
+            "recorded": True,
+            "payment_session_id":
+                request.payment_session_id,
+            "status":
+                normalized_status,
+            "message":
+                "Payment status recorded successfully",
+        }
 
     except HTTPException:
         db.rollback()

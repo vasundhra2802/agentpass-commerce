@@ -249,3 +249,34 @@ export async function getGrowthSuggestions(items, maxBudget) {
 
   return await response.json();
 }
+export async function recordPaymentFailure({
+  payment_session_id,
+  status,
+  reason = null,
+}) {
+  const response = await fetch(
+    `${API_BASE_URL}/payment/failure`,
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        payment_session_id,
+        status,
+        reason,
+      }),
+    }
+  );
+
+  const data = await response.json();
+
+  if (!response.ok) {
+    throw new Error(
+      data.detail ||
+        "Could not record payment status"
+    );
+  }
+
+  return data;
+}

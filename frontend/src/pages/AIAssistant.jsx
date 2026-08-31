@@ -7,6 +7,7 @@ import {
   createPaymentOrder,
   verifyPayment,
   getGrowthSuggestions,
+  recordPaymentFailure,
 } from "../services/api";
 
 function AIAssistant() {
@@ -86,6 +87,7 @@ const handleTestPayment = async () => {
         "Only Razorpay Test Mode is allowed."
       );
     }
+    let paymentFailureRecorded = false;
 
     const options = {
       key: order.key_id,
@@ -128,7 +130,24 @@ const handleTestPayment = async () => {
       },
 
       modal: {
-        ondismiss: function () {
+        ondismiss: async function () {
+          if (!paymentFailureRecorded) {
+            try {
+              await recordPaymentFailure({
+                payment_session_id:
+                  order.payment_session_id,
+                status: "CANCELLED",
+                reason: "User closed Test checkout",
+              });
+              paymentFailureRecorded = true;
+            } catch (error) {
+              console.error(
+                "Could not persist checkout cancellation:",
+                error
+              );
+            }
+          }
+
           setPaymentStatus("cancelled");
           setPaymentMessage(
             "Test checkout was closed. No payment was completed."
@@ -141,14 +160,30 @@ const handleTestPayment = async () => {
       new window.Razorpay(options);
 
     razorpayCheckout.on(
-      "payment.failed",
-      function () {
-        setPaymentStatus("error");
-        setPaymentMessage(
-          "Test payment failed. No real money was charged."
-        );
-      }
+  "payment.failed",
+  async function () {
+    paymentFailureRecorded = true;
+
+    try {
+      await recordPaymentFailure({
+        payment_session_id:
+          order.payment_session_id,
+        status: "FAILED",
+        reason: "Razorpay Test payment failed",
+      });
+    } catch (error) {
+      console.error(
+        "Could not persist payment failure:",
+        error
+      );
+    }
+
+    setPaymentStatus("error");
+    setPaymentMessage(
+      "Test payment failed. No real money was charged."
     );
+  }
+);
 
     razorpayCheckout.open();
   } catch (error) {
